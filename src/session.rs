@@ -1,16 +1,18 @@
+mod input;
 mod pty;
 mod tx;
 
 use std::pin::Pin;
 
-use anyhow::{Context, Result, bail};
+use anyhow::{Context, Result, anyhow, bail};
 use bytes::Bytes;
-use tokio::io::{AsyncReadExt, AsyncWriteExt};
+use tokio::io::AsyncReadExt;
 use tokio::sync::mpsc;
+use tokio::task::JoinHandle;
 use tokio::time::{Instant, Sleep};
 use tokio_util::sync::CancellationToken;
 
-use crate::bluetooth::{BtCommand, BtEvent};
+use crate::bluetooth::{BtCommand, BtError, BtEvent, BtInput, ConnectionId};
 use crate::egress::EgressLimiter;
 use tx::{TxWindow, TxWrite};
 
@@ -60,11 +62,36 @@ impl BluetoothSink for crate::bluetooth::MainThreadCommandQueue {
     }
 }
 
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+#[derive(Clone, Debug, Eq, PartialEq)]
 pub enum SessionEnd {
     Disconnected,
     ChildExited,
+    ConnectionFailed(BtError),
     Shutdown,
+}
+
+pub struct SessionRequest {
+    config: SessionConfig,
+    connection: ConnectionId,
+    mtu: usize,
+    shutdown: CancellationToken,
+}
+
+impl SessionRequest {
+    #[must_use]
+    pub fn new(
+        config: SessionConfig,
+        connection: ConnectionId,
+        mtu: usize,
+        shutdown: CancellationToken,
+    ) -> Self {
+        Self {
+            config,
+            connection,
+            mtu,
+            shutdown,
+        }
+    }
 }
 
 /// Bridge one connected RFCOMM client to a newly spawned PTY child.
@@ -75,90 +102,134 @@ pub enum SessionEnd {
 /// validation, or Bluetooth command submission fails.
 pub async fn run_session<S: BluetoothSink>(
     events: &mut mpsc::UnboundedReceiver<BtEvent>,
+    input: &mut mpsc::Receiver<BtInput>,
     bluetooth: S,
-    config: SessionConfig,
-    mtu: usize,
+    request: SessionRequest,
     egress: &mut EgressLimiter,
-    shutdown: CancellationToken,
 ) -> Result<SessionEnd> {
+    let SessionRequest {
+        config,
+        connection,
+        mtu,
+        shutdown,
+    } = request;
     let output_capacity = egress.queue_capacity(PTY_CHUNK_SIZE)?;
     let mut process = pty::spawn(&config).context("spawn PTY session")?;
     let (output_tx, mut output_rx) = mpsc::channel(output_capacity);
     let reader_cancel = shutdown.child_token();
-    let reader_token = reader_cancel.clone();
-    let reader = tokio::spawn(async move {
+    let reader = spawn_reader(process.reader, output_tx, reader_cancel.clone());
+
+    let session_result = {
+        let mut bridge_state = Bridge {
+            events,
+            bluetooth: &bluetooth,
+            child: &mut process.child,
+            output_rx: &mut output_rx,
+            egress,
+            shutdown: &shutdown,
+            connection,
+        };
+        let bridge = bridge_state.run(mtu);
+        let input_pump = input::pump(input, connection, &mut process.writer);
+        tokio::pin!(bridge, input_pump);
+
+        tokio::select! {
+            biased;
+            result = &mut bridge => result,
+            result = &mut input_pump => match result {
+                Ok(never) => match never {},
+                Err(error) => Err(error),
+            },
+        }
+    };
+
+    reader_cancel.cancel();
+    let reader_result = reader
+        .await
+        .context("join PTY output reader")
+        .and_then(|result| result.context("read PTY output"));
+    drop(process.writer);
+    let cleanup_result = cleanup_child(&mut process.child).await;
+    drain_input(input);
+
+    merge_session_results(session_result, reader_result, cleanup_result)
+}
+
+fn spawn_reader(
+    mut reader: pty_process::OwnedReadPty,
+    output: mpsc::Sender<Bytes>,
+    cancel: CancellationToken,
+) -> JoinHandle<std::io::Result<()>> {
+    tokio::spawn(async move {
         let mut buffer = vec![0_u8; PTY_CHUNK_SIZE];
         loop {
+            let count = tokio::select! {
+                biased;
+                () = cancel.cancelled() => return Ok(()),
+                result = reader.read(&mut buffer) => result?,
+            };
+            if count == 0 {
+                return Ok(());
+            }
+            let chunk = Bytes::copy_from_slice(&buffer[..count]);
             tokio::select! {
                 biased;
-                () = reader_token.cancelled() => return Ok::<(), std::io::Error>(()),
-                result = process.reader.read(&mut buffer) => {
-                    let count = result?;
-                    if count == 0 {
-                        return Ok(());
-                    }
-                    if output_tx
-                        .send(Bytes::copy_from_slice(&buffer[..count]))
-                        .await
-                        .is_err()
-                    {
+                () = cancel.cancelled() => return Ok(()),
+                result = output.send(chunk) => {
+                    if result.is_err() {
                         return Ok(());
                     }
                 }
             }
         }
-    });
+    })
+}
 
-    let session_result = Bridge {
-        events,
-        bluetooth: &bluetooth,
-        writer: &mut process.writer,
-        child: &mut process.child,
-        output_rx: &mut output_rx,
-        egress,
-        shutdown: &shutdown,
+async fn cleanup_child(child: &mut tokio::process::Child) -> Result<()> {
+    if child.try_wait().context("inspect PTY child")?.is_none() {
+        child.start_kill().context("kill PTY child")?;
+        child.wait().await.context("reap PTY child")?;
     }
-    .run(mtu)
-    .await;
+    Ok(())
+}
 
-    reader_cancel.cancel();
-    reader.abort();
-    let _ = reader.await;
-    drop(process.writer);
-    let cleanup_result = async {
-        if process
-            .child
-            .try_wait()
-            .context("inspect PTY child")?
-            .is_none()
-        {
-            process.child.start_kill().context("kill PTY child")?;
-            process.child.wait().await.context("reap PTY child")?;
-        }
-        Ok::<(), anyhow::Error>(())
-    }
-    .await;
+fn drain_input(input: &mut mpsc::Receiver<BtInput>) {
+    while input.try_recv().is_ok() {}
+}
 
-    match session_result {
-        Ok(end) => {
-            cleanup_result?;
-            Ok(end)
-        }
+fn merge_session_results(
+    session: Result<SessionEnd>,
+    reader: Result<()>,
+    cleanup: Result<()>,
+) -> Result<SessionEnd> {
+    let mut errors = Vec::new();
+    let end = match session {
+        Ok(end) => Some(end),
         Err(error) => {
-            let _ = cleanup_result;
-            Err(error)
+            errors.push(format!("session bridge failed: {error:#}"));
+            None
         }
+    };
+    if let Err(error) = reader {
+        errors.push(format!("PTY reader failed: {error:#}"));
     }
+    if let Err(error) = cleanup {
+        errors.push(format!("PTY child cleanup failed: {error:#}"));
+    }
+    if errors.is_empty() {
+        return end.ok_or_else(|| anyhow!("session ended without a result"));
+    }
+    bail!(errors.join("; "))
 }
 
 struct Bridge<'a, S> {
     events: &'a mut mpsc::UnboundedReceiver<BtEvent>,
     bluetooth: &'a S,
-    writer: &'a mut pty_process::OwnedWritePty,
     child: &'a mut tokio::process::Child,
     output_rx: &'a mut mpsc::Receiver<Bytes>,
     egress: &'a mut EgressLimiter,
     shutdown: &'a CancellationToken,
+    connection: ConnectionId,
 }
 
 impl<S: BluetoothSink> Bridge<'_, S> {
@@ -167,17 +238,22 @@ impl<S: BluetoothSink> Bridge<'_, S> {
         let mut scheduled_write = None;
         let send_timer = tokio::time::sleep_until(Instant::now());
         tokio::pin!(send_timer);
+        let mut child_exited = false;
+        let mut output_closed = false;
 
         loop {
+            if child_exited && output_closed && window.is_drained() && scheduled_write.is_none() {
+                return Ok(SessionEnd::ChildExited);
+            }
+
             tokio::select! {
                 biased;
                 () = self.shutdown.cancelled() => return Ok(SessionEnd::Shutdown),
                 event = self.events.recv() => {
                     match event.context("Bluetooth event channel closed")? {
-                        BtEvent::Data(data) => {
-                            self.writer.write_all(&data).await.context("write raw RFCOMM data to PTY")?;
-                        }
-                        BtEvent::WriteComplete { token, bytes_written, status } => {
+                        BtEvent::WriteComplete { connection, token, bytes_written, status }
+                            if connection == self.connection =>
+                        {
                             if status != 0 {
                                 bail!("RFCOMM async write {token:?} failed with IOReturn {status:#x}");
                             }
@@ -188,19 +264,32 @@ impl<S: BluetoothSink> Bridge<'_, S> {
                                 &mut scheduled_write,
                                 send_timer.as_mut(),
                                 self.bluetooth,
+                                self.connection,
                             )?;
                         }
-                        BtEvent::FlowControlChanged => {}
-                        BtEvent::Disconnected => return Ok(SessionEnd::Disconnected),
-                        BtEvent::Error(error) => return Err(error.into()),
-                        BtEvent::Connected { .. } => bail!("received a second Bluetooth connection during a session"),
+                        BtEvent::ConnectionError { connection, error }
+                            if connection == self.connection =>
+                        {
+                            return Ok(SessionEnd::ConnectionFailed(error));
+                        }
+                        BtEvent::Disconnected { connection } if connection == self.connection => {
+                            return Ok(SessionEnd::Disconnected);
+                        }
+                        BtEvent::Fatal(error) => return Err(error.into()),
+                        BtEvent::Connected { connection, .. } if connection == self.connection => {
+                            bail!("received duplicate Bluetooth connection event during a session");
+                        }
+                        BtEvent::Connected { .. }
+                        | BtEvent::WriteComplete { .. }
+                        | BtEvent::ConnectionError { .. }
+                        | BtEvent::Disconnected { .. } => {}
                     }
                 }
-                status = self.child.wait() => {
+                status = self.child.wait(), if !child_exited => {
                     status.context("wait for PTY child")?;
-                    return Ok(SessionEnd::ChildExited);
+                    child_exited = true;
                 }
-                output = self.output_rx.recv(), if window.is_ready_for_chunk() => {
+                output = self.output_rx.recv(), if !output_closed && window.is_ready_for_chunk() => {
                     match output {
                         Some(data) => {
                             window.enqueue(data)?;
@@ -210,16 +299,17 @@ impl<S: BluetoothSink> Bridge<'_, S> {
                                 &mut scheduled_write,
                                 send_timer.as_mut(),
                                 self.bluetooth,
+                                self.connection,
                             )?;
                         }
-                        None => return Ok(SessionEnd::ChildExited),
+                        None => output_closed = true,
                     }
                 }
                 () = &mut send_timer, if scheduled_write.is_some() => {
                     let Some(write) = scheduled_write.take() else {
                         bail!("send timer fired without a scheduled RFCOMM write");
                     };
-                    submit_write(self.bluetooth, write)?;
+                    submit_write(self.bluetooth, self.connection, write)?;
                 }
             }
         }
@@ -232,6 +322,7 @@ fn schedule_next<S: BluetoothSink>(
     scheduled_write: &mut Option<TxWrite>,
     mut send_timer: Pin<&mut Sleep>,
     bluetooth: &S,
+    connection: ConnectionId,
 ) -> Result<()> {
     if scheduled_write.is_some() {
         bail!("cannot schedule overlapping RFCOMM writes");
@@ -239,7 +330,7 @@ fn schedule_next<S: BluetoothSink>(
     if let Some(write) = window.start_write() {
         let deadline = egress.reserve(write.data.len())?;
         if deadline <= Instant::now() {
-            submit_write(bluetooth, write)?;
+            submit_write(bluetooth, connection, write)?;
         } else {
             *scheduled_write = Some(write);
             send_timer.as_mut().reset(deadline);
@@ -248,8 +339,13 @@ fn schedule_next<S: BluetoothSink>(
     Ok(())
 }
 
-fn submit_write<S: BluetoothSink>(bluetooth: &S, write: TxWrite) -> Result<()> {
+fn submit_write<S: BluetoothSink>(
+    bluetooth: &S,
+    connection: ConnectionId,
+    write: TxWrite,
+) -> Result<()> {
     bluetooth.submit(BtCommand::Send {
+        connection,
         token: write.token,
         data: write.data,
     })

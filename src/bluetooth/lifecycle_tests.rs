@@ -172,6 +172,25 @@ fn test_shutdown_tracks_rejected_channels_delivered_while_closing() {
 }
 
 #[test]
+fn test_delivered_channel_cancels_queued_service_withdrawal() {
+    let mut lifecycle = published_lifecycle();
+
+    assert_eq!(
+        lifecycle.begin_shutdown().unwrap(),
+        LifecycleAction::WithdrawService
+    );
+    assert!(lifecycle.is_withdrawing());
+
+    lifecycle.rejected_channel_opened().unwrap();
+    assert!(!lifecycle.is_withdrawing());
+    assert_eq!(
+        lifecycle.rejected_channel_closed().unwrap(),
+        LifecycleAction::WithdrawService
+    );
+    assert!(lifecycle.is_withdrawing());
+}
+
+#[test]
 fn test_lifecycle_rejects_channel_before_publication_and_after_stop() {
     let mut lifecycle = Lifecycle::new();
     assert!(lifecycle.channel_opened().is_err());

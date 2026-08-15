@@ -40,6 +40,10 @@ impl TxWindow {
         self.chunk.is_none()
     }
 
+    pub(crate) fn is_drained(&self) -> bool {
+        self.chunk.is_none() && self.outstanding.is_none()
+    }
+
     pub(crate) fn enqueue(&mut self, chunk: Bytes) -> Result<()> {
         if chunk.is_empty() {
             bail!("cannot enqueue an empty PTY output chunk");

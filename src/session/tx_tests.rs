@@ -25,6 +25,7 @@ fn test_tx_window_splits_chunks_at_mtu() {
     assert_eq!(&third.data[..], b"ij");
     window.complete(third.token, 2).unwrap();
     assert!(window.is_ready_for_chunk());
+    assert!(window.is_drained());
 }
 
 #[test]
@@ -34,6 +35,7 @@ fn test_tx_window_keeps_one_outstanding_write() {
     let write = window.start_write().unwrap();
 
     assert!(window.start_write().is_none());
+    assert!(!window.is_drained());
     assert!(!window.is_ready_for_chunk());
     assert!(window.enqueue(Bytes::from_static(b"later")).is_err());
     window.complete(write.token, write.data.len()).unwrap();

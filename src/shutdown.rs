@@ -1,20 +1,44 @@
-use anyhow::{Context, Result};
+use anyhow::{Context, Result, bail};
+use tokio::signal::unix::{Signal, SignalKind};
 use tokio_util::sync::CancellationToken;
 
-/// Cancel the shared shutdown token after SIGINT or SIGTERM.
-///
-/// # Errors
-///
-/// Returns an error if the platform signal handlers cannot be installed or
-/// polled.
-pub async fn wait_for_signal(shutdown: CancellationToken) -> Result<()> {
-    let mut terminate = tokio::signal::unix::signal(tokio::signal::unix::SignalKind::terminate())
-        .context("install SIGTERM handler")?;
+pub struct SignalWaiter {
+    interrupt: Signal,
+    terminate: Signal,
+}
 
-    tokio::select! {
-        result = tokio::signal::ctrl_c() => result.context("wait for SIGINT")?,
-        _ = terminate.recv() => {},
+impl SignalWaiter {
+    /// Install SIGINT and SIGTERM handlers before Bluetooth is published.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if Tokio cannot register either signal source.
+    pub fn install() -> Result<Self> {
+        let interrupt = tokio::signal::unix::signal(SignalKind::interrupt())
+            .context("install SIGINT handler")?;
+        let terminate = tokio::signal::unix::signal(SignalKind::terminate())
+            .context("install SIGTERM handler")?;
+        Ok(Self {
+            interrupt,
+            terminate,
+        })
     }
-    shutdown.cancel();
-    Ok(())
+
+    /// Wait for one termination signal and cancel the shared token.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the selected platform signal stream closes
+    /// unexpectedly.
+    pub async fn wait(mut self, shutdown: CancellationToken) -> Result<()> {
+        let received = tokio::select! {
+            signal = self.interrupt.recv() => signal,
+            signal = self.terminate.recv() => signal,
+        };
+        if received.is_none() {
+            bail!("termination signal stream closed")
+        }
+        shutdown.cancel();
+        Ok(())
+    }
 }

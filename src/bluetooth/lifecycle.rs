@@ -75,7 +75,15 @@ impl Lifecycle {
                     .ok_or_else(|| anyhow::anyhow!("rejected RFCOMM channel count overflow"))?;
                 Ok(())
             }
-            State::Unpublished | State::WithdrawingService | State::Stopped => {
+            State::WithdrawingService => {
+                self.rejected_channels = self
+                    .rejected_channels
+                    .checked_add(1)
+                    .ok_or_else(|| anyhow::anyhow!("rejected RFCOMM channel count overflow"))?;
+                self.state = State::WaitingForRejectedShutdown;
+                Ok(())
+            }
+            State::Unpublished | State::Stopped => {
                 bail!("cannot track an RFCOMM channel without a live listener")
             }
         }
@@ -242,6 +250,10 @@ impl Lifecycle {
             bail!("Bluetooth lifecycle stopped with rejected channels still tracked");
         }
         Ok(())
+    }
+
+    pub(super) const fn is_withdrawing(&self) -> bool {
+        matches!(self.state, State::WithdrawingService)
     }
 
     fn begin_service_withdrawal(&mut self) -> LifecycleAction {

@@ -55,6 +55,32 @@ impl FromStr for DeviceAddress {
 pub struct DeviceAddressError(String);
 
 #[derive(Clone, Copy, Debug, Eq, Hash, PartialEq)]
+pub struct ConnectionId(NonZeroU64);
+
+impl ConnectionId {
+    #[must_use]
+    pub const fn new(value: u64) -> Option<Self> {
+        match NonZeroU64::new(value) {
+            Some(value) => Some(Self(value)),
+            None => None,
+        }
+    }
+
+    #[must_use]
+    pub const fn get(self) -> u64 {
+        self.0.get()
+    }
+
+    #[must_use]
+    pub const fn next(self) -> Self {
+        match Self::new(self.get().wrapping_add(1)) {
+            Some(next) => next,
+            None => Self(NonZeroU64::MIN),
+        }
+    }
+}
+
+#[derive(Clone, Copy, Debug, Eq, Hash, PartialEq)]
 pub struct WriteToken(NonZeroU64);
 
 impl WriteToken {
@@ -83,25 +109,46 @@ impl WriteToken {
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub enum BtEvent {
     Connected {
+        connection: ConnectionId,
         device: DeviceAddress,
         mtu: usize,
         paired: bool,
     },
-    Data(Bytes),
     WriteComplete {
+        connection: ConnectionId,
         token: WriteToken,
         bytes_written: usize,
         status: i32,
     },
-    FlowControlChanged,
-    Disconnected,
-    Error(BtError),
+    ConnectionError {
+        connection: ConnectionId,
+        error: BtError,
+    },
+    Disconnected {
+        connection: ConnectionId,
+    },
+    Fatal(BtError),
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct BtInput {
+    pub connection: ConnectionId,
+    pub data: Bytes,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub enum BtCommand {
-    Send { token: WriteToken, data: Bytes },
-    Close,
+    AcceptNext {
+        after: ConnectionId,
+    },
+    Send {
+        connection: ConnectionId,
+        token: WriteToken,
+        data: Bytes,
+    },
+    Close {
+        connection: ConnectionId,
+    },
     Shutdown,
 }
 

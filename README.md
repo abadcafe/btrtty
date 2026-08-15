@@ -6,7 +6,7 @@
 Linux terminal                    Mac
 picocom / screen                  btrtty
         ↕                              ↕
-/dev/rfcomm0 ← raw RFCOMM/SPP → async PTY ←→ zsh/tmux
+/dev/rfcomm0 ← raw RFCOMM/SPP → async PTY ←→ bash/tmux
 ```
 
 当前 v0.1 使用固定 PTY 尺寸、单个 active client、系统配对认证和限速透明字节流。不会解析 ANSI、转换 CRLF、插入控制帧或记录终端 payload。
@@ -23,8 +23,9 @@ macOS main thread                 Tokio runtime（2 workers）
 ```
 
 - IOBluetooth 对象只存在于 `MainThreadOnly` actor，未实现或伪造 `Send`/`Sync`。
-- delegate callback 只复制数据并发送事件；不操作 PTY、不等待、不执行 shell。
+- data callback 只复制 payload 并尝试写入有界输入通道；close、flow-control 和 write-completion callback 只投递 native action，其中可重复的 flow/input-overflow hint 会合并。incoming-open callback 只建立 channel 所有权、delegate 和 close notification；所有应用状态转换都在 callback 栈外执行。任何 callback 都不操作 PTY、不等待、不执行 shell。
 - Tokio 命令经 `CFRunLoopSourceSignal` + `CFRunLoopWakeUp` 送回主线程，无轮询。
+- 每条连接都有不可复用的 `ConnectionId`；`Send`、`Close`、write completion、input 和 disconnect 全部带连接 ID。旧连接的延迟事件/命令不能命中新连接。首次 acceptance 在 listener publication 前已经 armed；之后只有上一条连接的真实 close callback 才能产生一次性的 reconnect permit。
 - RFCOMM 只使用 `writeAsync`，每次不超过 MTU，同时最多一个 outstanding write。
 - SDP record 和 incoming listener 与长期运行的 btrtty 进程同寿命；普通 client disconnect 只销毁本次 PTY/bash，绝不重新发布 Bluetooth 服务。
 - 每个 active channel 都注册独立的 channel-close notification；actor 必须同时收到 outstanding write completion 和真实 channel-close callback，才会释放 channel 与 pending `Bytes`，两个事件无论谁先到都不能越过另一道屏障。超过单 active-client 限制的已打开 channel 也会被保留并等待真实 close callback，不会直接丢弃 Objective-C 对象。
@@ -35,6 +36,8 @@ macOS main thread                 Tokio runtime（2 workers）
 - 启动只发布一次 transient SDP record。所有可能失败的 CFRunLoop 基础设施在发布前创建；notification 注册失败时必须成功回滚本次 SDP record，否则启动直接报错。
 - Mac→Linux 默认限制为 20 KiB/s；空闲不会积累 burst，最多首个 `256 B` PTY chunk 立即发送，调度进度跨 Bluetooth 重连保留。
 - PTY output 使用 `256 B` chunk，bounded queue 按限速值容纳约 100 ms 输出；下游变慢时通过 PTY/kernel 自然反压，不丢字符。
+- Linux→Mac payload 使用独立的 `128` 条 bounded input queue；队列满会关闭当前连接，不会无限增长。断线/退出会取消正在等待 PTY 可写的 future，旧连接残留输入在重新开放 accept gate 前清空。
+- SIGINT/SIGTERM handler 在 SDP publication 前完成安装。Tokio application task 即使 panic，watchdog 也会请求 native shutdown；PTY reader、child reap 和 native teardown 的错误均会返回，不会静默吞掉。
 
 ## 构建
 

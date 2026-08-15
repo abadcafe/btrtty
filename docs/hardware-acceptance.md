@@ -12,7 +12,7 @@ cargo clippy --all-targets --all-features -- -D warnings
 ./scripts/package.sh
 ```
 
-- 46 项模块/单元测试与 2 项二进制元数据测试通过。
+- 61 项模块/单元测试与 2 项二进制元数据测试通过。
 - 单文件 Mach-O 内嵌稳定 `CFBundleIdentifier` 和 `NSBluetoothAlwaysUsageDescription`，无 App Bundle。
 - RFCOMM 与 PTY 之间没有握手、控制帧或 payload 转换。
 - PTY 往返保持 UTF-8、NUL、ESC/方向键序列原始字节。
@@ -20,14 +20,19 @@ cargo clippy --all-targets --all-features -- -D warnings
 - `--rows/--cols` 指定的尺寸已经通过 `stty size` 集成测试验证。
 - PTY 设置 `TERM=xterm-256color`、`COLORTERM=truecolor`，不安装自定义终端描述。
 - MTU 分块且同时只有一个 outstanding RFCOMM write。
+- 所有 data、write completion、close 和 command 均由不可复用的 `ConnectionId` 隔离；旧连接事件不能命中新连接。首次 acceptance 在 listener publication 前 armed，reconnect permit 只能消费一次。
 - `--max-output-rate` 默认 20 KiB/s，只接受 `1..=200`。
 - 空闲不会积累 burst；最多首个 `256 B` PTY chunk 立即发送，后续输出按配置速率调度，进度不会因 Bluetooth 重连重置。
 - `256 B` PTY chunk 的 bounded output queue 按限速值动态容纳约 100 ms 数据；在 1/20/200 KiB/s 下容量分别为 1/8/80 个 chunk。
 - 取消会 kill/reap PTY child。
+- Linux→Mac 使用 128 条 bounded input queue；队列满会关闭当前连接，阻塞中的 PTY input write 可被 shutdown/disconnect 取消，unpaired/旧连接残留输入会在下一次 accept 前清空。
+- PTY child 退出后会先排空已读取的 output 和 RFCOMM write completion；PTY reader、join 和 child cleanup 错误不会被吞掉。
 - 未配对的 Bluetooth 连接在创建 PTY 前收到 `Close`；已配对连接不额外要求链路加密。
 - 单实例锁会拒绝第二个 live btrtty，并在 owner 退出后允许重新获取。
 - Bluetooth 生命周期状态机已覆盖：等待 outstanding write、等待 active/rejected channel 的实际 close callback、session close 升级为 shutdown、channel 全部关闭后才允许移除 SDP，以及 SDP 移除后才允许停止 CFRunLoop。
 - 启动路径只发布一次 SDP；所有可失败的 CFRunLoop 基础设施先于 publication 创建，incoming notification 注册失败必须检查 SDP rollback。
+- SIGINT/SIGTERM handler 在 SDP publication 前安装；Tokio application task panic 由 watchdog 转成 native shutdown 请求。
+- native callback action 在 callback 栈外处理；重复的 flow/input-overflow hint 在每次 dispatch 前合并，避免 callback flood 形成无界 action queue。
 - 删除了 device-wide `closeConnection()` fallback、自动 drain、固定延时和启动时 publish-remove-republish 伪清理。
 
 ## 本机 Bluetooth smoke test（当前二进制待重测）

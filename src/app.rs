@@ -1,11 +1,13 @@
-use anyhow::Result;
+use std::future::Future;
+
+use anyhow::{Context, Result};
 use tokio::sync::mpsc;
 use tokio_util::sync::CancellationToken;
 use tracing::{info, warn};
 
-use crate::bluetooth::{BtCommand, BtEvent, DeviceAddress};
+use crate::bluetooth::{BtCommand, BtEvent, BtInput, ConnectionId, DeviceAddress};
 use crate::egress::{EgressLimiter, OutputRate};
-use crate::session::{BluetoothSink, SessionConfig, SessionEnd, run_session};
+use crate::session::{BluetoothSink, SessionConfig, SessionEnd, SessionRequest, run_session};
 
 #[derive(Clone, Debug)]
 pub struct AppConfig {
@@ -15,110 +17,222 @@ pub struct AppConfig {
 
 #[derive(Debug)]
 enum ServerState {
-    Starting,
     Waiting,
     Connected {
+        connection: ConnectionId,
         device: DeviceAddress,
         mtu: usize,
         paired: bool,
     },
     RunningSession {
+        connection: ConnectionId,
         mtu: usize,
     },
-    Disconnecting,
-    Stopping,
+    Disconnecting {
+        connection: ConnectionId,
+    },
 }
 
-/// Run the asynchronous server state machine until shutdown.
+/// Build the asynchronous server around an already-published native listener.
+///
+/// The actor's initial acceptance gate is armed before SDP/listener publication,
+/// so the first connection never depends on this future being polled.
 ///
 /// # Errors
 ///
-/// Returns an error when the Bluetooth command bridge closes, a native
-/// Bluetooth operation fails, or a PTY session cannot be run or cleaned up.
-pub async fn run<S: BluetoothSink>(
-    mut events: mpsc::UnboundedReceiver<BtEvent>,
+/// Returns an error if an already-cancelled server cannot request native
+/// shutdown.
+pub fn start<S: BluetoothSink>(
+    events: mpsc::UnboundedReceiver<BtEvent>,
+    input: mpsc::Receiver<BtInput>,
     bluetooth: S,
     config: AppConfig,
     shutdown: CancellationToken,
-) -> Result<()> {
-    let mut state = ServerState::Starting;
-    let mut egress = EgressLimiter::new(config.output_rate);
+) -> Result<impl Future<Output = Result<()>> + Send> {
+    let stopped = shutdown.is_cancelled();
+    if stopped {
+        bluetooth.submit(BtCommand::Shutdown)?;
+    }
+    let server = Server {
+        events,
+        input,
+        bluetooth,
+        egress: EgressLimiter::new(config.output_rate),
+        config,
+        shutdown,
+    };
+    Ok(async move { if stopped { Ok(()) } else { server.run().await } })
+}
 
-    loop {
-        state = match state {
-            ServerState::Starting => {
-                info!("waiting for Bluetooth client");
-                ServerState::Waiting
-            }
-            ServerState::Waiting => {
-                tokio::select! {
-                    biased;
-                    event = events.recv() => match event {
-                        Some(BtEvent::Connected { device, mtu, paired }) => ServerState::Connected { device, mtu, paired },
-                        Some(BtEvent::Error(error)) => return Err(error.into()),
-                        Some(_) => ServerState::Waiting,
-                        None => ServerState::Stopping,
-                    },
-                    () = shutdown.cancelled() => ServerState::Stopping,
+struct Server<S> {
+    events: mpsc::UnboundedReceiver<BtEvent>,
+    input: mpsc::Receiver<BtInput>,
+    bluetooth: S,
+    egress: EgressLimiter,
+    config: AppConfig,
+    shutdown: CancellationToken,
+}
+
+impl<S: BluetoothSink> Server<S> {
+    async fn run(mut self) -> Result<()> {
+        let mut state = ServerState::Waiting;
+        info!("waiting for paired Bluetooth client");
+        loop {
+            let next = match state {
+                ServerState::Waiting => self.wait_for_client().await?,
+                ServerState::Connected {
+                    connection,
+                    device,
+                    mtu,
+                    paired,
+                } => self.accept_client(connection, &device, mtu, paired)?,
+                ServerState::RunningSession { connection, mtu } => {
+                    self.run_connected_session(connection, mtu).await?
                 }
-            }
-            ServerState::Connected {
+                ServerState::Disconnecting { connection } => {
+                    self.wait_for_disconnect(connection).await?
+                }
+            };
+            let Some(next) = next else {
+                return Ok(());
+            };
+            state = next;
+        }
+    }
+
+    async fn wait_for_client(&mut self) -> Result<Option<ServerState>> {
+        let Some(event) = self.next_event().await? else {
+            return self.stop();
+        };
+        Ok(Some(match event {
+            BtEvent::Connected {
+                connection,
                 device,
                 mtu,
                 paired,
-            } => {
-                if paired {
-                    info!(%device, mtu, "accepted paired Bluetooth client");
-                    ServerState::RunningSession { mtu }
-                } else {
-                    warn!(%device, "rejecting unpaired Bluetooth device");
-                    bluetooth.submit(BtCommand::Close)?;
-                    ServerState::Disconnecting
-                }
+            } => ServerState::Connected {
+                connection,
+                device,
+                mtu,
+                paired,
+            },
+            BtEvent::Fatal(error) => return Err(error.into()),
+            BtEvent::WriteComplete { .. }
+            | BtEvent::ConnectionError { .. }
+            | BtEvent::Disconnected { .. } => ServerState::Waiting,
+        }))
+    }
+
+    fn accept_client(
+        &self,
+        connection: ConnectionId,
+        device: &DeviceAddress,
+        mtu: usize,
+        paired: bool,
+    ) -> Result<Option<ServerState>> {
+        if self.shutdown.is_cancelled() {
+            return self.stop();
+        }
+        if paired {
+            info!(%device, mtu, "accepted paired Bluetooth client");
+            Ok(Some(ServerState::RunningSession { connection, mtu }))
+        } else {
+            warn!(%device, "rejecting unpaired Bluetooth device");
+            self.bluetooth.submit(BtCommand::Close { connection })?;
+            Ok(Some(ServerState::Disconnecting { connection }))
+        }
+    }
+
+    async fn run_connected_session(
+        &mut self,
+        connection: ConnectionId,
+        mtu: usize,
+    ) -> Result<Option<ServerState>> {
+        let end = run_session(
+            &mut self.events,
+            &mut self.input,
+            self.bluetooth.clone(),
+            SessionRequest::new(
+                self.config.session.clone(),
+                connection,
+                mtu,
+                self.shutdown.clone(),
+            ),
+            &mut self.egress,
+        )
+        .await?;
+        match end {
+            SessionEnd::Disconnected => {
+                info!(
+                    connection = connection.get(),
+                    "Bluetooth client disconnected"
+                );
+                self.accept_after(connection)?;
+                Ok(Some(ServerState::Waiting))
             }
-            ServerState::RunningSession { mtu } => {
-                match run_session(
-                    &mut events,
-                    bluetooth.clone(),
-                    config.session.clone(),
-                    mtu,
-                    &mut egress,
-                    shutdown.clone(),
-                )
-                .await?
-                {
-                    SessionEnd::Disconnected => {
-                        info!("Bluetooth client disconnected");
-                        ServerState::Waiting
-                    }
-                    SessionEnd::ChildExited => {
-                        info!("PTY child exited; closing Bluetooth client");
-                        bluetooth.submit(BtCommand::Close)?;
-                        ServerState::Disconnecting
-                    }
-                    SessionEnd::Shutdown => ServerState::Stopping,
-                }
+            SessionEnd::ChildExited => {
+                info!("PTY child exited; closing Bluetooth client");
+                self.close_and_wait(connection)
             }
-            ServerState::Disconnecting => {
-                tokio::select! {
-                    biased;
-                    event = events.recv() => match event {
-                        Some(BtEvent::Disconnected) => ServerState::Waiting,
-                        Some(BtEvent::Error(error)) => return Err(error.into()),
-                        Some(BtEvent::Connected { .. }) => {
-                            bluetooth.submit(BtCommand::Close)?;
-                            ServerState::Disconnecting
-                        }
-                        Some(_) => ServerState::Disconnecting,
-                        None => ServerState::Stopping,
-                    },
-                    () = shutdown.cancelled() => ServerState::Stopping,
-                }
+            SessionEnd::ConnectionFailed(error) => {
+                warn!(%error, "Bluetooth session failed; closing client");
+                self.close_and_wait(connection)
             }
-            ServerState::Stopping => {
-                bluetooth.submit(BtCommand::Shutdown)?;
-                return Ok(());
-            }
+            SessionEnd::Shutdown => self.stop(),
+        }
+    }
+
+    async fn wait_for_disconnect(
+        &mut self,
+        connection: ConnectionId,
+    ) -> Result<Option<ServerState>> {
+        let Some(event) = self.next_event().await? else {
+            return self.stop();
         };
+        match event {
+            BtEvent::Disconnected { connection: closed } if closed == connection => {
+                self.accept_after(connection)?;
+                Ok(Some(ServerState::Waiting))
+            }
+            BtEvent::Fatal(error) => Err(error.into()),
+            BtEvent::Connected {
+                connection: unexpected,
+                ..
+            } => {
+                self.bluetooth.submit(BtCommand::Close {
+                    connection: unexpected,
+                })?;
+                Ok(Some(ServerState::Disconnecting { connection }))
+            }
+            BtEvent::WriteComplete { .. }
+            | BtEvent::ConnectionError { .. }
+            | BtEvent::Disconnected { .. } => Ok(Some(ServerState::Disconnecting { connection })),
+        }
+    }
+
+    async fn next_event(&mut self) -> Result<Option<BtEvent>> {
+        tokio::select! {
+            biased;
+            () = self.shutdown.cancelled() => Ok(None),
+            event = self.events.recv() => Ok(Some(event.context("Bluetooth event channel closed")?)),
+        }
+    }
+
+    fn close_and_wait(&self, connection: ConnectionId) -> Result<Option<ServerState>> {
+        self.bluetooth.submit(BtCommand::Close { connection })?;
+        Ok(Some(ServerState::Disconnecting { connection }))
+    }
+
+    fn accept_after(&mut self, connection: ConnectionId) -> Result<()> {
+        while self.input.try_recv().is_ok() {}
+        self.bluetooth
+            .submit(BtCommand::AcceptNext { after: connection })?;
+        info!("waiting for paired Bluetooth client");
+        Ok(())
+    }
+
+    fn stop(&self) -> Result<Option<ServerState>> {
+        self.bluetooth.submit(BtCommand::Shutdown)?;
+        Ok(None)
     }
 }

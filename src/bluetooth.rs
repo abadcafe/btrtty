@@ -1,16 +1,20 @@
 mod actor;
+mod dispatch;
 mod lifecycle;
 mod main_queue;
 mod sdp;
 mod types;
 
-pub use main_queue::{BluetoothMainThread, MainThreadCommandQueue};
-pub use types::{BtCommand, BtError, BtEvent, DeviceAddress, WriteToken};
+pub const INPUT_QUEUE_CAPACITY: usize = 128;
+
+pub use dispatch::MainThreadCommandQueue;
+pub use main_queue::BluetoothMainThread;
+pub use types::{BtCommand, BtError, BtEvent, BtInput, ConnectionId, DeviceAddress, WriteToken};
 
 #[cfg(test)]
-mod lifecycle_tests;
+mod dispatch_tests;
 #[cfg(test)]
-mod main_queue_tests;
+mod lifecycle_tests;
 #[cfg(test)]
 mod sdp_tests;
 #[cfg(test)]

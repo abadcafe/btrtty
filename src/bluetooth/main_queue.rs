@@ -1,8 +1,6 @@
-use std::collections::VecDeque;
 use std::ffi::c_void;
-use std::sync::{Arc, Mutex};
 
-use anyhow::{Context, Result, bail};
+use anyhow::{Context, Result};
 use objc2::MainThreadMarker;
 use objc2::rc::{Retained as ObjcRetained, autoreleasepool};
 use objc2_core_foundation::{
@@ -12,81 +10,12 @@ use objc2_io_bluetooth::IOBluetoothHostController;
 use tokio::sync::mpsc;
 
 use super::actor::BluetoothActor;
-use super::types::{BtCommand, BtEvent, DeviceAddress};
-
-pub(super) struct CommandBuffer {
-    commands: VecDeque<BtCommand>,
-    active: bool,
-}
-
-impl CommandBuffer {
-    pub(super) fn new() -> Self {
-        Self {
-            commands: VecDeque::new(),
-            active: true,
-        }
-    }
-
-    pub(super) fn push(&mut self, command: BtCommand) -> Result<()> {
-        if !self.active {
-            bail!("Bluetooth main-thread command queue is closed");
-        }
-        self.commands.push_back(command);
-        Ok(())
-    }
-
-    pub(super) fn drain(&mut self) -> Vec<BtCommand> {
-        self.commands.drain(..).collect()
-    }
-
-    pub(super) fn close(&mut self) {
-        self.active = false;
-        self.commands.clear();
-    }
-}
-
-struct QueueState {
-    buffer: CommandBuffer,
-    source_address: usize,
-    run_loop_address: usize,
-}
-
-#[derive(Clone)]
-pub struct MainThreadCommandQueue {
-    state: Arc<Mutex<QueueState>>,
-}
-
-impl MainThreadCommandQueue {
-    /// Enqueue a command and wake the macOS main run loop.
-    ///
-    /// # Errors
-    ///
-    /// Returns an error after native shutdown starts or if the queue mutex was
-    /// poisoned by a panic.
-    pub fn submit(&self, command: BtCommand) -> Result<()> {
-        let mut state = self
-            .state
-            .lock()
-            .map_err(|_| anyhow::anyhow!("Bluetooth command queue mutex poisoned"))?;
-        state.buffer.push(command)?;
-
-        // SAFETY: BluetoothMainThread installs retained CF objects before it
-        // exposes this handle. It invalidates them only while holding the same
-        // mutex after marking the buffer inactive. Core Foundation documents
-        // CFRunLoopSourceSignal and CFRunLoopWakeUp as callable cross-thread.
-        unsafe {
-            let source = &*(state.source_address as *const CFRunLoopSource);
-            let run_loop = &*(state.run_loop_address as *const CFRunLoop);
-            source.signal();
-            run_loop.wake_up();
-        }
-        Ok(())
-    }
-}
+use super::dispatch::{DispatchItem, Dispatcher, MainThreadCommandQueue};
+use super::types::{BtCommand, BtEvent, BtInput, DeviceAddress};
 
 struct SourceContext {
     actor: ObjcRetained<BluetoothActor>,
-    queue: Arc<Mutex<QueueState>>,
+    dispatcher: Dispatcher,
 }
 
 pub struct BluetoothMainThread {
@@ -108,6 +37,7 @@ impl BluetoothMainThread {
     /// or `CFRunLoop` source installation fails.
     pub fn start(
         event_sender: mpsc::UnboundedSender<BtEvent>,
+        input_sender: mpsc::Sender<BtInput>,
         mtm: MainThreadMarker,
     ) -> Result<Self> {
         // SAFETY: This runs on the macOS main thread and only reads the active
@@ -120,16 +50,9 @@ impl BluetoothMainThread {
             .context("read local Bluetooth controller address")?;
         let local_address = DeviceAddress::new(&address.to_string())
             .context("parse local Bluetooth controller address")?;
-        let actor = BluetoothActor::new(event_sender, mtm);
-        let queue_state = Arc::new(Mutex::new(QueueState {
-            buffer: CommandBuffer::new(),
-            source_address: 0,
-            run_loop_address: 0,
-        }));
-        let mut context = Box::new(SourceContext {
-            actor,
-            queue: Arc::clone(&queue_state),
-        });
+        let dispatcher = Dispatcher::new();
+        let actor = BluetoothActor::new(event_sender, input_sender, dispatcher.native_queue(), mtm);
+        let mut context = Box::new(SourceContext { actor, dispatcher });
         let mut source_context = CFRunLoopSourceContext {
             version: 0,
             info: std::ptr::from_mut(&mut *context).cast::<c_void>(),
@@ -153,13 +76,7 @@ impl BluetoothMainThread {
         let common_modes =
             unsafe { kCFRunLoopCommonModes }.context("obtain kCFRunLoopCommonModes")?;
 
-        {
-            let mut state = queue_state
-                .lock()
-                .map_err(|_| anyhow::anyhow!("Bluetooth command queue mutex poisoned"))?;
-            state.source_address = std::ptr::from_ref(&*source) as usize;
-            state.run_loop_address = std::ptr::from_ref(&*run_loop) as usize;
-        }
+        context.dispatcher.install(&source, &run_loop)?;
 
         // Publication is the final fallible startup operation. The command
         // source and its stable context already exist, but the source is not
@@ -171,11 +88,12 @@ impl BluetoothMainThread {
             .context("publish Bluetooth SPP service")?;
         run_loop.add_source(Some(&source), Some(common_modes));
 
+        let queue = context.dispatcher.command_queue();
         Ok(Self {
             source,
             run_loop,
             context,
-            queue: MainThreadCommandQueue { state: queue_state },
+            queue,
             local_address,
             service_record_handle: endpoint.record_handle,
             channel_id: endpoint.channel_id,
@@ -215,9 +133,7 @@ impl BluetoothMainThread {
     }
 
     fn teardown(&mut self) -> Result<()> {
-        if let Ok(mut state) = self.queue.state.lock() {
-            state.buffer.close();
-        }
+        self.context.dispatcher.deactivate()?;
         // SAFETY: Same process-lifetime constant used when adding the source.
         if let Some(common_modes) = unsafe { kCFRunLoopCommonModes } {
             self.run_loop
@@ -235,19 +151,33 @@ unsafe extern "C-unwind" fn perform_commands(info: *mut c_void) {
     // SAFETY: `info` points at BluetoothMainThread's boxed SourceContext,
     // which outlives and is not moved while the source is registered.
     let context = unsafe { &*(info.cast::<SourceContext>()) };
-    let commands = match context.queue.lock() {
-        Ok(mut state) => state.buffer.drain(),
-        Err(_) => return,
+    let Ok(items) = context.dispatcher.drain() else {
+        context
+            .actor
+            .dispatch_failed("drain Bluetooth main-thread dispatch queue");
+        return;
     };
 
-    for command in commands {
-        if command == BtCommand::Shutdown {
-            if let Ok(mut state) = context.queue.lock() {
-                state.buffer.close();
+    let mut accepts_commands = true;
+    for item in items {
+        match item {
+            DispatchItem::Command(BtCommand::Shutdown) if accepts_commands => {
+                accepts_commands = false;
+                if context.dispatcher.close_commands().is_err() {
+                    context
+                        .actor
+                        .dispatch_failed("close Bluetooth main-thread command queue");
+                    return;
+                }
+                autoreleasepool(|_| context.actor.handle(BtCommand::Shutdown));
             }
-            autoreleasepool(|_| context.actor.handle(BtCommand::Shutdown));
-            break;
+            DispatchItem::Command(command) if accepts_commands => {
+                autoreleasepool(|_| context.actor.handle(command));
+            }
+            DispatchItem::Command(_) => {}
+            DispatchItem::Native(action) => {
+                autoreleasepool(|_| context.actor.handle_native(action));
+            }
         }
-        autoreleasepool(|_| context.actor.handle(command));
     }
 }
