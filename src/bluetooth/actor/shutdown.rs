@@ -134,6 +134,7 @@ impl BluetoothActor {
         let connection = active.connection;
         state.acceptance.connection_closed(connection)?;
         state.active = None;
+        state.retired_writes.clear();
         Ok(connection)
     }
 

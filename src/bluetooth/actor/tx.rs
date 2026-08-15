@@ -96,6 +96,7 @@ impl BluetoothActor {
             let action = {
                 let mut state = self.ivars().state.borrow_mut();
                 state.pending_writes.remove(&token);
+                state.retired_writes.insert(token);
                 state.lifecycle.write_completed()
             };
             self.emit_connection_error(connection, "submit RFCOMM async write", status);
@@ -133,6 +134,12 @@ impl BluetoothActor {
                 return;
             }
             let pending = state.pending_writes.remove(&token);
+            if pending.is_none() && state.retired_writes.contains(&token) {
+                return;
+            }
+            if pending.is_some() {
+                state.retired_writes.insert(token);
+            }
             let action = pending.as_ref().map(|_| state.lifecycle.write_completed());
             (pending, action)
         };
