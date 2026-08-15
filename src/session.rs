@@ -172,10 +172,6 @@ impl<S: BluetoothSink> Bridge<'_, S> {
             tokio::select! {
                 biased;
                 () = self.shutdown.cancelled() => return Ok(SessionEnd::Shutdown),
-                status = self.child.wait() => {
-                    status.context("wait for PTY child")?;
-                    return Ok(SessionEnd::ChildExited);
-                }
                 event = self.events.recv() => {
                     match event.context("Bluetooth event channel closed")? {
                         BtEvent::Data(data) => {
@@ -199,6 +195,10 @@ impl<S: BluetoothSink> Bridge<'_, S> {
                         BtEvent::Error(error) => return Err(error.into()),
                         BtEvent::Connected { .. } => bail!("received a second Bluetooth connection during a session"),
                     }
+                }
+                status = self.child.wait() => {
+                    status.context("wait for PTY child")?;
+                    return Ok(SessionEnd::ChildExited);
                 }
                 output = self.output_rx.recv(), if window.is_ready_for_chunk() => {
                     match output {

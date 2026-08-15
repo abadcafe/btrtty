@@ -21,7 +21,6 @@ enum ServerState {
         device: DeviceAddress,
         mtu: usize,
         paired: bool,
-        encrypted: bool,
     },
     RunningSession {
         mtu: usize,
@@ -55,7 +54,7 @@ pub async fn run<S: BluetoothSink>(
                 tokio::select! {
                     biased;
                     event = events.recv() => match event {
-                        Some(BtEvent::Connected { device, mtu, paired, encrypted }) => ServerState::Connected { device, mtu, paired, encrypted },
+                        Some(BtEvent::Connected { device, mtu, paired }) => ServerState::Connected { device, mtu, paired },
                         Some(BtEvent::Error(error)) => return Err(error.into()),
                         Some(_) => ServerState::Waiting,
                         None => ServerState::Stopping,
@@ -67,13 +66,12 @@ pub async fn run<S: BluetoothSink>(
                 device,
                 mtu,
                 paired,
-                encrypted,
             } => {
-                if paired && encrypted {
+                if paired {
                     info!(%device, mtu, "accepted paired Bluetooth client");
                     ServerState::RunningSession { mtu }
                 } else {
-                    warn!(%device, paired, encrypted, "rejecting Bluetooth device without an authenticated encrypted link");
+                    warn!(%device, "rejecting unpaired Bluetooth device");
                     bluetooth.submit(BtCommand::Close)?;
                     ServerState::Disconnecting
                 }

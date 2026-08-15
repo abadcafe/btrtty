@@ -9,13 +9,13 @@ const PTY_CHUNK_SIZE: usize = 256;
 #[test]
 fn test_output_rate_accepts_supported_bounds() {
     assert_eq!(OutputRate::new(1).unwrap().kib_per_second(), 1);
-    assert_eq!(OutputRate::new(100).unwrap().kib_per_second(), 100);
+    assert_eq!(OutputRate::new(200).unwrap().kib_per_second(), 200);
 }
 
 #[test]
 fn test_output_rate_rejects_values_outside_supported_range() {
     assert!(OutputRate::new(0).is_err());
-    assert!(OutputRate::new(101).is_err());
+    assert!(OutputRate::new(201).is_err());
 }
 
 #[test]
@@ -78,10 +78,10 @@ fn test_queue_capacity_tracks_configured_rate() {
         8
     );
     assert_eq!(
-        EgressLimiter::new(OutputRate::new(100).unwrap())
+        EgressLimiter::new(OutputRate::new(200).unwrap())
             .queue_capacity(PTY_CHUNK_SIZE)
             .unwrap(),
-        40
+        80
     );
 }
 

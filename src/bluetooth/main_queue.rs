@@ -8,10 +8,11 @@ use objc2::rc::{Retained as ObjcRetained, autoreleasepool};
 use objc2_core_foundation::{
     CFRetained, CFRunLoop, CFRunLoopSource, CFRunLoopSourceContext, kCFRunLoopCommonModes,
 };
+use objc2_io_bluetooth::IOBluetoothHostController;
 use tokio::sync::mpsc;
 
 use super::actor::BluetoothActor;
-use super::types::{BtCommand, BtEvent};
+use super::types::{BtCommand, BtEvent, DeviceAddress};
 
 pub(super) struct CommandBuffer {
     commands: VecDeque<BtCommand>,
@@ -93,6 +94,7 @@ pub struct BluetoothMainThread {
     run_loop: CFRetained<CFRunLoop>,
     context: Box<SourceContext>,
     queue: MainThreadCommandQueue,
+    local_address: DeviceAddress,
     channel_id: u8,
 }
 
@@ -107,6 +109,16 @@ impl BluetoothMainThread {
         event_sender: mpsc::UnboundedSender<BtEvent>,
         mtm: MainThreadMarker,
     ) -> Result<Self> {
+        // SAFETY: This runs on the macOS main thread and only reads the active
+        // host controller's immutable address.
+        let controller = unsafe { IOBluetoothHostController::defaultController() }
+            .context("obtain default Bluetooth controller")?;
+        // SAFETY: `controller` is retained for this call and returns an owned
+        // NSString when the active controller has a readable address.
+        let address = unsafe { controller.addressAsString() }
+            .context("read local Bluetooth controller address")?;
+        let local_address = DeviceAddress::new(&address.to_string())
+            .context("parse local Bluetooth controller address")?;
         let actor = BluetoothActor::new(event_sender, mtm);
         let channel_id = actor.publish().context("publish Bluetooth SPP service")?;
         let queue_state = Arc::new(Mutex::new(QueueState {
@@ -155,6 +167,7 @@ impl BluetoothMainThread {
             run_loop,
             context,
             queue: MainThreadCommandQueue { state: queue_state },
+            local_address,
             channel_id,
         })
     }
@@ -165,26 +178,38 @@ impl BluetoothMainThread {
     }
 
     #[must_use]
+    pub fn local_address(&self) -> &DeviceAddress {
+        &self.local_address
+    }
+
+    #[must_use]
     pub const fn channel_id(&self) -> u8 {
         self.channel_id
     }
 
-    pub fn run(mut self) {
+    /// Run the native event loop until the actor's strict shutdown barrier is
+    /// complete.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if native teardown ended with a listener, service,
+    /// channel, or asynchronous write still alive.
+    pub fn run(mut self) -> Result<()> {
         CFRunLoop::run();
-        self.teardown();
+        self.teardown()
     }
 
-    fn teardown(&mut self) {
+    fn teardown(&mut self) -> Result<()> {
         if let Ok(mut state) = self.queue.state.lock() {
             state.buffer.close();
         }
-        self.context.actor.shutdown();
         // SAFETY: Same process-lifetime constant used when adding the source.
         if let Some(common_modes) = unsafe { kCFRunLoopCommonModes } {
             self.run_loop
                 .remove_source(Some(&self.source), Some(common_modes));
         }
         self.source.invalidate();
+        self.context.actor.finish()
     }
 }
 
@@ -205,12 +230,7 @@ unsafe extern "C-unwind" fn perform_commands(info: *mut c_void) {
             if let Ok(mut state) = context.queue.lock() {
                 state.buffer.close();
             }
-            let shutdown_complete = autoreleasepool(|_| context.actor.shutdown());
-            if shutdown_complete {
-                if let Some(run_loop) = CFRunLoop::main() {
-                    run_loop.stop();
-                }
-            }
+            autoreleasepool(|_| context.actor.shutdown());
             break;
         }
         autoreleasepool(|_| context.actor.handle(command));

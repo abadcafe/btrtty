@@ -11,6 +11,7 @@ mod platform {
     use btrtty::bluetooth::{BluetoothMainThread, BtCommand};
     use btrtty::cli::Cli;
     use btrtty::egress::OutputRate;
+    use btrtty::instance::InstanceLock;
     use btrtty::session::SessionConfig;
     use btrtty::shutdown;
     use clap::Parser;
@@ -28,6 +29,7 @@ mod platform {
     }
 
     fn start(args: Cli) -> Result<()> {
+        let _instance_lock = InstanceLock::acquire_default()?;
         let mtm = MainThreadMarker::new().context("btrtty must start on the macOS main thread")?;
         let runtime = Builder::new_multi_thread()
             .worker_threads(2)
@@ -62,14 +64,16 @@ mod platform {
         });
 
         println!("Published Bluetooth Serial Port");
+        println!("Bluetooth address: {}", native.local_address());
         println!("RFCOMM channel: {channel_id}");
         println!("Waiting for paired client...");
-        native.run();
-
-        runtime
+        let native_result = native.run();
+        let app_result = runtime
             .block_on(app_task)
-            .context("Tokio application task panicked")??;
-        Ok(())
+            .context("Tokio application task panicked")
+            .and_then(|result| result);
+        native_result?;
+        app_result
     }
 
     fn init_logging() {

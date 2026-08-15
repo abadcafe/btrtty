@@ -89,6 +89,7 @@ dependencies = [
  "anyhow",
  "bytes",
  "clap",
+ "libc",
  "objc2",
  "objc2-core-foundation",
  "objc2-foundation",

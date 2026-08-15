@@ -5,6 +5,8 @@ pub mod bluetooth;
 pub mod cli;
 pub mod egress;
 #[cfg(target_os = "macos")]
+pub mod instance;
+#[cfg(target_os = "macos")]
 pub mod session;
 #[cfg(target_os = "macos")]
 pub mod shutdown;
@@ -15,5 +17,7 @@ mod app_tests;
 mod cli_tests;
 #[cfg(all(test, target_os = "macos"))]
 mod egress_tests;
+#[cfg(all(test, target_os = "macos"))]
+mod instance_tests;
 #[cfg(all(test, target_os = "macos"))]
 mod session_tests;

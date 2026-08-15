@@ -218,6 +218,22 @@ async fn test_run_session_cancellation_stops_child() {
 }
 
 #[tokio::test]
+async fn test_run_session_prefers_queued_disconnect_over_child_exit() {
+    let sink = ObservableSink::default();
+    let (event_tx, mut event_rx) = mpsc::unbounded_channel();
+    let shutdown = CancellationToken::new();
+    let mut limiter = test_limiter();
+    let config = SessionConfig::new("exit 0", 40, 120).unwrap();
+
+    event_tx.send(BtEvent::Disconnected).unwrap();
+    let result = run_session(&mut event_rx, sink, config, 127, &mut limiter, shutdown)
+        .await
+        .unwrap();
+
+    assert_eq!(result, SessionEnd::Disconnected);
+}
+
+#[tokio::test]
 async fn test_run_session_limits_sustained_output() {
     let sink = ObservableSink::default();
     let observer = sink.clone();

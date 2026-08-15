@@ -2,7 +2,7 @@ use std::cell::RefCell;
 use std::collections::HashMap;
 use std::ffi::c_void;
 
-use anyhow::{Result, bail};
+use anyhow::{Result, anyhow, bail};
 use bytes::Bytes;
 use objc2::rc::{Retained, autoreleasepool};
 use objc2::runtime::AnyObject;
@@ -15,39 +15,38 @@ use objc2_io_bluetooth::{
 };
 use tokio::sync::mpsc;
 
+use super::close_barrier::{CloseAction, CloseBarrier, CloseCompletion, CloseRequest};
 use super::sdp;
 use super::types::{BtCommand, BtError, BtEvent, DeviceAddress, WriteToken};
 
 struct PendingWrite {
-    #[allow(dead_code)]
     token: WriteToken,
     data: Bytes,
 }
 
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
-enum TxState {
-    Idle,
-    Writing { token: WriteToken },
+struct ActiveChannel {
+    channel: Retained<IOBluetoothRFCOMMChannel>,
+    close_notification: Retained<IOBluetoothUserNotification>,
 }
 
 struct ActorState {
     service_record: Option<Retained<IOBluetoothSDPServiceRecord>>,
-    notification: Option<Retained<IOBluetoothUserNotification>>,
-    channel: Option<Retained<IOBluetoothRFCOMMChannel>>,
+    incoming_notification: Option<Retained<IOBluetoothUserNotification>>,
+    active: Option<ActiveChannel>,
     pending_writes: HashMap<WriteToken, PendingWrite>,
-    tx: TxState,
-    shutting_down: bool,
+    close_barrier: CloseBarrier,
+    fatal_error: Option<BtError>,
 }
 
 impl Default for ActorState {
     fn default() -> Self {
         Self {
             service_record: None,
-            notification: None,
-            channel: None,
+            incoming_notification: None,
+            active: None,
             pending_writes: HashMap::new(),
-            tx: TxState::Idle,
-            shutting_down: false,
+            close_barrier: CloseBarrier::new(),
+            fatal_error: None,
         }
     }
 }
@@ -76,12 +75,12 @@ define_class!(
         #[unsafe(method(rfcommChannelData:data:length:))]
         unsafe fn rfcommChannelData_data_length(
             &self,
-            _channel: Option<&IOBluetoothRFCOMMChannel>,
+            channel: Option<&IOBluetoothRFCOMMChannel>,
             data_pointer: *mut c_void,
             data_length: usize,
         ) {
             autoreleasepool(|_| {
-                if data_pointer.is_null() || data_length == 0 {
+                if !self.is_active_channel(channel) || data_pointer.is_null() || data_length == 0 {
                     return;
                 }
                 // SAFETY: IOBluetooth guarantees this buffer is valid for the
@@ -89,53 +88,65 @@ define_class!(
                 let data = unsafe {
                     std::slice::from_raw_parts(data_pointer.cast::<u8>(), data_length)
                 };
-                let _ = self.ivars().events.send(BtEvent::Data(Bytes::copy_from_slice(data)));
+                let _ = self
+                    .ivars()
+                    .events
+                    .send(BtEvent::Data(Bytes::copy_from_slice(data)));
             });
         }
 
         #[unsafe(method(rfcommChannelClosed:))]
-        unsafe fn rfcommChannelClosed(
-            &self,
-            _channel: Option<&IOBluetoothRFCOMMChannel>,
-        ) {
-            autoreleasepool(|_| self.channel_closed());
+        unsafe fn rfcommChannelClosed(&self, channel: Option<&IOBluetoothRFCOMMChannel>) {
+            autoreleasepool(|_| self.channel_closed(channel));
         }
 
         #[unsafe(method(rfcommChannelFlowControlChanged:))]
         unsafe fn rfcommChannelFlowControlChanged(
             &self,
-            _channel: Option<&IOBluetoothRFCOMMChannel>,
+            channel: Option<&IOBluetoothRFCOMMChannel>,
         ) {
-            let _ = self.ivars().events.send(BtEvent::FlowControlChanged);
+            if self.is_active_channel(channel) {
+                let _ = self.ivars().events.send(BtEvent::FlowControlChanged);
+            }
         }
 
         #[unsafe(method(rfcommChannelQueueSpaceAvailable:))]
         unsafe fn rfcommChannelQueueSpaceAvailable(
             &self,
-            _channel: Option<&IOBluetoothRFCOMMChannel>,
+            channel: Option<&IOBluetoothRFCOMMChannel>,
         ) {
-            let _ = self.ivars().events.send(BtEvent::FlowControlChanged);
+            if self.is_active_channel(channel) {
+                let _ = self.ivars().events.send(BtEvent::FlowControlChanged);
+            }
         }
 
         #[unsafe(method(rfcommChannelWriteComplete:refcon:status:))]
         unsafe fn rfcommChannelWriteComplete_refcon_status(
             &self,
-            _channel: Option<&IOBluetoothRFCOMMChannel>,
+            channel: Option<&IOBluetoothRFCOMMChannel>,
             refcon: *mut c_void,
             status: i32,
         ) {
-            autoreleasepool(|_| self.write_completed(refcon, status, None));
+            autoreleasepool(|_| {
+                if self.is_active_channel(channel) {
+                    self.write_completed(refcon, status, None);
+                }
+            });
         }
 
         #[unsafe(method(rfcommChannelWriteComplete:refcon:status:bytesWritten:))]
         unsafe fn rfcommChannelWriteComplete_refcon_status_bytesWritten(
             &self,
-            _channel: Option<&IOBluetoothRFCOMMChannel>,
+            channel: Option<&IOBluetoothRFCOMMChannel>,
             refcon: *mut c_void,
             status: i32,
             bytes_written: usize,
         ) {
-            autoreleasepool(|_| self.write_completed(refcon, status, Some(bytes_written)));
+            autoreleasepool(|_| {
+                if self.is_active_channel(channel) {
+                    self.write_completed(refcon, status, Some(bytes_written));
+                }
+            });
         }
     }
 
@@ -147,6 +158,15 @@ define_class!(
             channel: &IOBluetoothRFCOMMChannel,
         ) {
             autoreleasepool(|_| self.channel_opened(notification, channel));
+        }
+
+        #[unsafe(method(rfcommChannelClosedNotification:channel:))]
+        fn rfcomm_channel_closed_notification(
+            &self,
+            _notification: &IOBluetoothUserNotification,
+            channel: &IOBluetoothRFCOMMChannel,
+        ) {
+            autoreleasepool(|_| self.channel_closed(Some(channel)));
         }
     }
 );
@@ -187,44 +207,29 @@ impl BluetoothActor {
 
         let mut state = self.ivars().state.borrow_mut();
         state.service_record = Some(service.record);
-        state.notification = Some(notification);
+        state.incoming_notification = Some(notification);
         Ok(service.channel_id)
     }
 
     pub(super) fn handle(&self, command: BtCommand) {
         match command {
             BtCommand::Send { token, data } => self.send(token, data),
-            BtCommand::Close => self.close(),
-            BtCommand::Shutdown => {
-                self.shutdown();
-            }
+            BtCommand::Close => self.begin_close(CloseRequest::Session),
+            BtCommand::Shutdown => self.shutdown(),
         }
     }
 
-    pub(super) fn shutdown(&self) -> bool {
-        let (channel, notification, record) = {
+    pub(super) fn shutdown(&self) {
+        let (notification, record) = {
             let mut state = self.ivars().state.borrow_mut();
-            if state.shutting_down {
-                return state.pending_writes.is_empty();
-            }
-            state.shutting_down = true;
             (
-                state.channel.take(),
-                state.notification.take(),
-                state.service_record.take(),
+                state.incoming_notification.take(),
+                state.service_record.clone(),
             )
         };
 
-        let had_channel = channel.is_some();
-        let mut close_failed = false;
-        if let Some(channel) = channel {
-            // SAFETY: The channel is owned by this main-thread actor.
-            let status = unsafe { channel.closeChannel() };
-            if status != 0 {
-                close_failed = true;
-                self.emit_error("close RFCOMM channel during shutdown", status);
-            }
-        }
+        // Withdraw the listener before touching the active channel. This makes
+        // it impossible for a new incoming channel to enter during teardown.
         if let Some(notification) = notification {
             // SAFETY: The actor owns this live registration.
             unsafe { notification.unregister() };
@@ -232,16 +237,34 @@ impl BluetoothActor {
         if let Some(record) = record {
             // SAFETY: The actor owns this published transient service.
             let status = unsafe { record.removeServiceRecord() };
-            if status != 0 {
+            if status == 0 {
+                self.ivars().state.borrow_mut().service_record = None;
+            } else {
                 self.emit_error("remove SDP service", status);
             }
         }
-        let mut state = self.ivars().state.borrow_mut();
-        if close_failed || !had_channel {
-            state.pending_writes.clear();
-            state.tx = TxState::Idle;
+
+        self.begin_close(CloseRequest::Shutdown);
+    }
+
+    pub(super) fn finish(&self) -> Result<()> {
+        let state = self.ivars().state.borrow();
+        if state.incoming_notification.is_some() {
+            bail!("Bluetooth shutdown ended with an incoming listener registered");
         }
-        state.pending_writes.is_empty()
+        if state.service_record.is_some() {
+            bail!("Bluetooth shutdown ended with the SDP service published");
+        }
+        if state.active.is_some() {
+            bail!("Bluetooth shutdown ended before RFCOMM channel-close notification");
+        }
+        if !state.pending_writes.is_empty() {
+            bail!("Bluetooth shutdown ended with RFCOMM writes outstanding");
+        }
+        if let Some(error) = &state.fatal_error {
+            return Err(anyhow!(error.clone()));
+        }
+        Ok(())
     }
 
     fn channel_opened(
@@ -251,49 +274,88 @@ impl BluetoothActor {
     ) {
         {
             let state = self.ivars().state.borrow();
-            if state.shutting_down
-                || state.notification.as_deref() != Some(notification)
-                || state.channel.is_some()
+            if state.incoming_notification.as_deref() != Some(notification)
+                || state.active.is_some()
             {
-                // SAFETY: This is an incoming channel delivered on the actor's
-                // main thread. It was never installed as the active channel.
+                // SAFETY: This incoming channel was never installed as active.
                 unsafe { channel.closeChannel() };
                 return;
             }
         }
 
-        // Retain before installing the channel because Apple's notification
-        // callback only lends the object for the duration of this call.
         let channel = IOBluetoothRFCOMMChannel::retain(channel);
         // SAFETY: The channel is open and accessed only by the main-thread actor.
         let mtu = usize::from(unsafe { channel.getMTU() });
-        // SAFETY: The channel is open and accessed only by the main-thread actor.
-        // Reading pairing state is non-blocking. Pairing itself is owned by
-        // macOS; this callback never opens UI or requests authentication.
+        // SAFETY: Pairing state and address reads are non-blocking. Pairing UI
+        // remains entirely owned by macOS.
         let remote = unsafe { channel.getDevice() };
         let paired = remote
             .as_deref()
             .is_some_and(|device| unsafe { device.isPaired() });
-        let encrypted = remote
-            .as_deref()
-            .is_some_and(|device| unsafe { device.getEncryptionMode() != 0 });
         let device = remote
             .and_then(|device| unsafe { device.addressString() })
             .and_then(|address| DeviceAddress::new(&address.to_string()).ok());
         let Some(device) = device else {
-            // SAFETY: The retained incoming channel is valid and main-thread-owned.
+            // SAFETY: The retained channel is valid and main-thread-owned.
             unsafe { channel.closeChannel() };
             self.emit_error("read client address", -1);
             return;
         };
         if mtu == 0 {
-            // SAFETY: The retained incoming channel is valid and main-thread-owned.
+            // SAFETY: The retained channel is valid and main-thread-owned.
             unsafe { channel.closeChannel() };
             self.emit_error("read RFCOMM MTU", -1);
             return;
         }
 
-        self.ivars().state.borrow_mut().channel = Some(channel.clone());
+        let object: &AnyObject = self;
+        // SAFETY: The selector has Apple's `(notification, channel)` shape and
+        // this main-thread actor outlives the registration.
+        let close_notification = unsafe {
+            channel.registerForChannelCloseNotification_selector(
+                Some(object),
+                Some(sel!(rfcommChannelClosedNotification:channel:)),
+            )
+        };
+        let Some(close_notification) = close_notification else {
+            // SAFETY: The channel was not exposed to the application.
+            unsafe { channel.closeChannel() };
+            self.emit_error("register RFCOMM channel-close notification", -1);
+            return;
+        };
+
+        // SAFETY: `self` implements the delegate, both objects remain on the
+        // native main thread, and the close registration is already live.
+        let status = unsafe { channel.setDelegate(Some(object)) };
+        if status != 0 {
+            // SAFETY: This actor owns the close notification registration.
+            unsafe { close_notification.unregister() };
+            // SAFETY: The channel was not exposed to the application.
+            unsafe { channel.closeChannel() };
+            self.emit_error("set RFCOMM delegate", status);
+            return;
+        }
+
+        if self
+            .ivars()
+            .state
+            .borrow_mut()
+            .close_barrier
+            .channel_opened()
+            .is_err()
+        {
+            // SAFETY: This actor still owns the unused registration.
+            unsafe { close_notification.unregister() };
+            // SAFETY: This duplicate channel was never installed as active.
+            unsafe { channel.closeChannel() };
+            self.emit_error("open overlapping RFCOMM channel", -1);
+            return;
+        }
+        self.ivars().state.borrow_mut().active = Some(ActiveChannel {
+            channel: channel.clone(),
+            close_notification,
+        });
+
         if self
             .ivars()
             .events
@@ -301,38 +363,38 @@ impl BluetoothActor {
                 device,
                 mtu,
                 paired,
-                encrypted,
             })
             .is_err()
         {
-            self.close();
-            return;
-        }
-
-        let object: &AnyObject = self;
-        // SAFETY: `self` implements IOBluetoothRFCOMMChannelDelegate, remains
-        // retained by BluetoothMainThread, and both objects stay on main.
-        let status = unsafe { channel.setDelegate(Some(object)) };
-        if status != 0 {
-            self.emit_error("set RFCOMM delegate", status);
-            self.close();
+            self.begin_close(CloseRequest::Session);
         }
     }
 
-    fn channel_closed(&self) {
-        let shutting_down = {
-            let mut state = self.ivars().state.borrow_mut();
-            state.channel = None;
-            state.pending_writes.clear();
-            state.tx = TxState::Idle;
-            state.shutting_down
+    fn channel_closed(&self, channel: Option<&IOBluetoothRFCOMMChannel>) {
+        let Some(channel) = channel else {
+            self.emit_error("receive RFCOMM close without channel", -1);
+            return;
         };
-        if shutting_down {
-            if let Some(run_loop) = CFRunLoop::main() {
-                run_loop.stop();
+        let completion = {
+            let mut state = self.ivars().state.borrow_mut();
+            let is_current = state
+                .active
+                .as_ref()
+                .is_some_and(|active| std::ptr::eq(active.channel.as_ref(), channel));
+            if !is_current {
+                return;
             }
-        } else {
-            let _ = self.ivars().events.send(BtEvent::Disconnected);
+            let active = state.active.take().expect("active channel was checked");
+            // SAFETY: The callback proves the channel is closed, so this
+            // actor-owned registration is no longer needed.
+            unsafe { active.close_notification.unregister() };
+            state.pending_writes.clear();
+            state.close_barrier.channel_closed()
+        };
+
+        match completion {
+            Ok(completion) => self.complete_close(completion),
+            Err(_) => self.emit_error("complete RFCOMM close barrier", -1),
         }
     }
 
@@ -341,22 +403,23 @@ impl BluetoothActor {
             self.emit_error("encode RFCOMM write token", -1);
             return;
         };
-        let (channel, pointer, length) = {
+        let prepared = {
             let mut state = self.ivars().state.borrow_mut();
-            let Some(channel) = state.channel.clone() else {
+            let Some(channel) = state.active.as_ref().map(|active| active.channel.clone()) else {
                 drop(state);
                 self.emit_error("write without RFCOMM client", -1);
                 return;
             };
-            if state.tx != TxState::Idle {
-                drop(state);
-                self.emit_error("overlapping RFCOMM write", -1);
-                return;
-            }
+            // SAFETY: The channel is open and main-thread-owned.
             let mtu = usize::from(unsafe { channel.getMTU() });
             if data.is_empty() || data.len() > mtu || data.len() > usize::from(u16::MAX) {
                 drop(state);
                 self.emit_error("invalid RFCOMM write length", -1);
+                return;
+            }
+            if state.close_barrier.write_started().is_err() {
+                drop(state);
+                self.emit_error("overlapping or closing RFCOMM write", -1);
                 return;
             }
 
@@ -365,24 +428,29 @@ impl BluetoothActor {
             state
                 .pending_writes
                 .insert(token, PendingWrite { token, data });
-            state.tx = TxState::Writing { token };
             (channel, pointer, length)
         };
 
-        // SAFETY: `pointer` addresses the Bytes retained in `pending_writes`.
-        // It remains alive until the matching delegate completion removes it.
+        let (channel, pointer, length) = prepared;
+        // SAFETY: `pointer` addresses Bytes retained in `pending_writes` until
+        // the matching completion or actual channel-close callback.
         let status =
             unsafe { channel.writeAsync_length_refcon(pointer, length, refcon as *mut c_void) };
         if status != 0 {
-            let mut state = self.ivars().state.borrow_mut();
-            state.pending_writes.remove(&token);
-            state.tx = TxState::Idle;
-            drop(state);
+            let action = {
+                let mut state = self.ivars().state.borrow_mut();
+                state.pending_writes.remove(&token);
+                state.close_barrier.write_completed()
+            };
             let _ = self.ivars().events.send(BtEvent::WriteComplete {
                 token,
                 bytes_written: 0,
                 status,
             });
+            match action {
+                Ok(action) => self.apply_close_action(action),
+                Err(_) => self.emit_error("roll back rejected RFCOMM write", -1),
+            }
         }
     }
 
@@ -392,21 +460,18 @@ impl BluetoothActor {
             self.emit_error("decode RFCOMM write token", -1);
             return;
         };
-        let (pending, current) = {
+        let (pending, action) = {
             let mut state = self.ivars().state.borrow_mut();
-            let current = state.tx == (TxState::Writing { token });
-            if current {
-                state.tx = TxState::Idle;
-            }
-            (state.pending_writes.remove(&token), current)
+            let pending = state.pending_writes.remove(&token);
+            let action = pending
+                .as_ref()
+                .map(|_| state.close_barrier.write_completed());
+            (pending, action)
         };
         let Some(pending) = pending else {
             return;
         };
         debug_assert_eq!(pending.token, token);
-        if !current {
-            return;
-        }
         let bytes_written =
             actual.unwrap_or_else(|| if status == 0 { pending.data.len() } else { 0 });
         let _ = self.ivars().events.send(BtEvent::WriteComplete {
@@ -414,34 +479,97 @@ impl BluetoothActor {
             bytes_written,
             status,
         });
-    }
-
-    fn close(&self) {
-        let channel = {
-            let mut state = self.ivars().state.borrow_mut();
-            state.channel.take()
-        };
-        let Some(channel) = channel else {
-            let _ = self.ivars().events.send(BtEvent::Disconnected);
-            return;
-        };
-        // SAFETY: The channel is retained locally through a possible
-        // synchronous close callback, and the actor is on the main thread.
-        let status = unsafe { channel.closeChannel() };
-        if status != 0 {
-            let mut state = self.ivars().state.borrow_mut();
-            state.pending_writes.clear();
-            state.tx = TxState::Idle;
-            drop(state);
-            self.emit_error("close RFCOMM channel", status);
-            let _ = self.ivars().events.send(BtEvent::Disconnected);
+        match action.expect("pending write has a barrier transition") {
+            Ok(action) => self.apply_close_action(action),
+            Err(_) => self.emit_error("complete RFCOMM write barrier", -1),
         }
     }
 
-    fn emit_error(&self, operation: &'static str, status: i32) {
-        let _ = self
+    fn begin_close(&self, request: CloseRequest) {
+        let action = self
             .ivars()
-            .events
-            .send(BtEvent::Error(BtError::new(operation, status)));
+            .state
+            .borrow_mut()
+            .close_barrier
+            .begin_close(request);
+        self.apply_close_action(action);
+    }
+
+    fn apply_close_action(&self, action: CloseAction) {
+        match action {
+            CloseAction::Wait => {}
+            CloseAction::CloseChannel => self.submit_channel_close(),
+            CloseAction::Complete(completion) => self.complete_close(completion),
+        }
+    }
+
+    fn submit_channel_close(&self) {
+        let channel = self
+            .ivars()
+            .state
+            .borrow()
+            .active
+            .as_ref()
+            .map(|active| active.channel.clone());
+        let Some(channel) = channel else {
+            self.emit_error("close missing RFCOMM channel", -1);
+            Self::stop_run_loop();
+            return;
+        };
+
+        // SAFETY: The channel is retained across a possible synchronous close
+        // callback. Completion still requires the registered close callback.
+        let status = unsafe { channel.closeChannel() };
+        if status == 0 {
+            return;
+        }
+        self.emit_error("close RFCOMM channel", status);
+
+        // A failed RFCOMM close submission cannot satisfy the barrier. Ask the
+        // owning device connection to close, then still wait for the channel
+        // callback. If even that request fails, exit explicitly with failure.
+        let fallback =
+            unsafe { channel.getDevice() }.map_or(-1, |device| unsafe { device.closeConnection() });
+        if fallback != 0 {
+            self.emit_error("close Bluetooth device connection", fallback);
+            Self::stop_run_loop();
+        }
+    }
+
+    fn complete_close(&self, completion: CloseCompletion) {
+        match completion {
+            CloseCompletion::Remote | CloseCompletion::Session => {
+                let _ = self.ivars().events.send(BtEvent::Disconnected);
+            }
+            CloseCompletion::Shutdown => Self::stop_run_loop(),
+        }
+    }
+
+    fn is_active_channel(&self, channel: Option<&IOBluetoothRFCOMMChannel>) -> bool {
+        let Some(channel) = channel else {
+            return false;
+        };
+        self.ivars()
+            .state
+            .borrow()
+            .active
+            .as_ref()
+            .is_some_and(|active| std::ptr::eq(active.channel.as_ref(), channel))
+    }
+
+    fn emit_error(&self, operation: &'static str, status: i32) {
+        let error = BtError::new(operation, status);
+        self.ivars()
+            .state
+            .borrow_mut()
+            .fatal_error
+            .get_or_insert_with(|| error.clone());
+        let _ = self.ivars().events.send(BtEvent::Error(error));
+    }
+
+    fn stop_run_loop() {
+        if let Some(run_loop) = CFRunLoop::main() {
+            run_loop.stop();
+        }
     }
 }

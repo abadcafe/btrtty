@@ -86,7 +86,6 @@ pub enum BtEvent {
         device: DeviceAddress,
         mtu: usize,
         paired: bool,
-        encrypted: bool,
     },
     Data(Bytes),
     WriteComplete {

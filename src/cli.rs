@@ -16,6 +16,6 @@ pub struct Cli {
     pub cols: u16,
 
     /// Maximum Mac-to-client output rate in KiB per second.
-    #[arg(long, default_value_t = 20, value_parser = clap::value_parser!(u16).range(1..=100))]
+    #[arg(long, default_value_t = 20, value_parser = clap::value_parser!(u16).range(1..=200))]
     pub max_output_rate: u16,
 }

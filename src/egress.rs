@@ -5,7 +5,7 @@ use tokio::time::Instant;
 
 const KIB: u64 = 1024;
 const MIN_RATE_KIB_PER_SECOND: u16 = 1;
-const MAX_RATE_KIB_PER_SECOND: u16 = 100;
+const MAX_RATE_KIB_PER_SECOND: u16 = 200;
 const NANOS_PER_SECOND: u128 = 1_000_000_000;
 const MILLIS_PER_SECOND: u64 = 1_000;
 const QUEUE_TARGET_MILLIS: u64 = 100;
@@ -21,7 +21,7 @@ impl OutputRate {
     ///
     /// # Errors
     ///
-    /// Returns an error unless `kib_per_second` is in `1..=100`.
+    /// Returns an error unless `kib_per_second` is in `1..=200`.
     pub fn new(kib_per_second: u16) -> Result<Self> {
         if !(MIN_RATE_KIB_PER_SECOND..=MAX_RATE_KIB_PER_SECOND).contains(&kib_per_second) {
             bail!(

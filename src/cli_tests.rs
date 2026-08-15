@@ -22,13 +22,13 @@ fn test_parse_custom_session() {
         "--cols",
         "177",
         "--max-output-rate",
-        "100",
+        "200",
     ])
     .expect("valid arguments");
 
     assert!(cli.command.contains("tmux"));
     assert_eq!((cli.rows, cli.cols), (51, 177));
-    assert_eq!(cli.max_output_rate, 100);
+    assert_eq!(cli.max_output_rate, 200);
 }
 
 #[test]
@@ -40,5 +40,5 @@ fn test_parse_rejects_zero_size() {
 #[test]
 fn test_parse_rejects_output_rate_outside_supported_range() {
     assert!(Cli::try_parse_from(["btrtty", "--max-output-rate", "0"]).is_err());
-    assert!(Cli::try_parse_from(["btrtty", "--max-output-rate", "101"]).is_err());
+    assert!(Cli::try_parse_from(["btrtty", "--max-output-rate", "201"]).is_err());
 }
