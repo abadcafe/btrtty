@@ -63,8 +63,12 @@ mod platform {
             result
         });
 
-        println!("Published Bluetooth Serial Port");
+        println!("Registered Bluetooth Serial Port");
         println!("Bluetooth address: {}", native.local_address());
+        println!(
+            "SDP record handle: {:#010X}",
+            native.service_record_handle()
+        );
         println!("RFCOMM channel: {channel_id}");
         println!("Waiting for paired client...");
         let native_result = native.run();

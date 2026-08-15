@@ -26,9 +26,13 @@ macOS main thread                 Tokio runtime（2 workers）
 - delegate callback 只复制数据并发送事件；不操作 PTY、不等待、不执行 shell。
 - Tokio 命令经 `CFRunLoopSourceSignal` + `CFRunLoopWakeUp` 送回主线程，无轮询。
 - RFCOMM 只使用 `writeAsync`，每次不超过 MTU，同时最多一个 outstanding write。
-- 每个 active channel 都注册独立的 channel-close notification；actor 持有 pending `Bytes`，直到 write completion 或系统确认 channel 已关闭。
-- 关闭顺序固定为：撤销 incoming notification → 删除 SDP record → 等待 outstanding write → 请求关闭 channel → 等待 channel-close callback。callback 到达前不会报告断开、退出主 run loop 或释放单实例锁。
+- SDP record 和 incoming listener 与长期运行的 btrtty 进程同寿命；普通 client disconnect 只销毁本次 PTY/bash，绝不重新发布 Bluetooth 服务。
+- 每个 active channel 都注册独立的 channel-close notification；actor 必须同时收到 outstanding write completion 和真实 channel-close callback，才会释放 channel 与 pending `Bytes`，两个事件无论谁先到都不能越过另一道屏障。超过单 active-client 限制的已打开 channel 也会被保留并等待真实 close callback，不会直接丢弃 Objective-C 对象。
+- 最终关闭顺序固定为：停止 PTY 和新 write → 等待 outstanding write → 请求关闭已知 channel → 等待全部 channel-close callback → 删除 SDP record → 注销 incoming notification → 停止 CFRunLoop。不得提前报告 native shutdown 完成。
+- `closeChannel()` 提交失败时不会用设备级 ACL 关闭兜底，也不会假装 channel 已关闭；actor 保留所有权并继续等远端真实 close callback，完成资源清理后以错误状态退出。
+- IOBluetooth 不提供枚举或取消 pre-open pending incoming connection 的公开 API。SIGINT/SIGTERM 的明确前置条件是操作者先停止 Linux 侧所有新连接和自动重试；btrtty 不包含虚假的 drain、延时轮询或 publish-remove-republish 清理。
 - 进程持有排他单实例锁；第二个 btrtty 会直接报错，不会与旧 listener 竞争或尝试接管其 channel。
+- 启动只发布一次 transient SDP record。所有可能失败的 CFRunLoop 基础设施在发布前创建；notification 注册失败时必须成功回滚本次 SDP record，否则启动直接报错。
 - Mac→Linux 默认限制为 20 KiB/s；空闲不会积累 burst，最多首个 `256 B` PTY chunk 立即发送，调度进度跨 Bluetooth 重连保留。
 - PTY output 使用 `256 B` chunk，bounded queue 按限速值容纳约 100 ms 输出；下游变慢时通过 PTY/kernel 自然反压，不丢字符。
 
@@ -93,13 +97,22 @@ PTY output queue 根据该参数动态容纳约 100 ms 的数据：在 1、20（
 默认值是 `exec /bin/bash -l`、24 行、80 列（即通常所说的 `80×24`）和 20 KiB/s。正常启动会显示系统动态分配的 RFCOMM channel：
 
 ```text
-Published Bluetooth Serial Port
+Registered Bluetooth Serial Port
 Bluetooth address: 10:B5:88:4D:11:18
+SDP record handle: 0x4F491101
 RFCOMM channel: 11
 Waiting for paired client...
 ```
 
-客户端断开时，btrtty 等到 IOBluetooth 的实际 channel-close callback 后才销毁本次 PTY 并重新进入等待。SIGINT/SIGTERM 也执行同一关闭屏障；旧进程彻底撤销 SDP/listener 并确认 active channel 关闭后才退出，因此退出后才能启动下一实例。btrtty 不会用开关 Bluetooth controller 之类的全局操作掩盖残留状态。
+客户端断开时，btrtty 必须同时等到 outstanding write completion（若存在）和 IOBluetooth 的实际 channel-close callback，随后才销毁本次 PTY 并重新进入等待；SDP/listener 全程不动。SIGINT/SIGTERM 也必须跨过这两道屏障，之后才依次删除 SDP、注销 listener 并退出。
+
+### 长期运行与退出契约
+
+推荐在 tmux 中启动一次 btrtty，日常只 detach tmux；Linux 可以反复 connect/disconnect，不需要重启 btrtty。
+
+IOBluetooth 只在 RFCOMM channel 已经打开以后通知应用，btrtty 无法观察 `bluetoothd` 已收到但尚未交付的 pending connection。因此停止服务前，操作者必须先停止 Linux 上的 `rfcomm connect` 以及任何自动重试，再向 btrtty 发送 SIGINT/SIGTERM。程序不会用等待固定秒数、关闭设备 ACL、切换 Bluetooth controller 或杀死 `bluetoothd` 来假装清理完成。
+
+若旧版或异常退出已经使 macOS Bluetooth daemon 留下不可见的 RFCOMM 状态，新进程无法通过公开 IOBluetooth API 枚举或删除它。一次性恢复流程是：停止 Linux 连接、退出 btrtty、在 macOS 关闭并重新打开 Bluetooth，然后启动当前版本。该全局操作只用于人工故障恢复，不属于 btrtty 启动或关闭流程。
 
 Linux 窗口变化不会修改 Mac PTY；需要其他尺寸时，使用新的 `--rows/--cols` 重启 server。tmux 模式下，Bluetooth 断线只销毁本次 PTY client；tmux session 本身保留，重连会重新 attach。
 
@@ -136,6 +149,8 @@ picocom -b 115200 --flow n /dev/rfcomm0
 ```bash
 sudo rfcomm release /dev/rfcomm0
 ```
+
+准备停止 Mac 上长期运行的 btrtty 时，必须先执行 release，并确认没有 `rfcomm connect` 或其他客户端在自动重试，然后再向 btrtty 发送 SIGINT/SIGTERM。
 
 BlueZ 上游把传统 `rfcomm` CLI 放在 deprecated tools 构建选项中，因此部分发行版不会默认安装。先检查：
 

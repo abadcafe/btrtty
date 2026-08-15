@@ -95,6 +95,7 @@ pub struct BluetoothMainThread {
     context: Box<SourceContext>,
     queue: MainThreadCommandQueue,
     local_address: DeviceAddress,
+    service_record_handle: u32,
     channel_id: u8,
 }
 
@@ -120,7 +121,6 @@ impl BluetoothMainThread {
         let local_address = DeviceAddress::new(&address.to_string())
             .context("parse local Bluetooth controller address")?;
         let actor = BluetoothActor::new(event_sender, mtm);
-        let channel_id = actor.publish().context("publish Bluetooth SPP service")?;
         let queue_state = Arc::new(Mutex::new(QueueState {
             buffer: CommandBuffer::new(),
             source_address: 0,
@@ -152,7 +152,6 @@ impl BluetoothMainThread {
         // the standard common-modes constant for the lifetime of the process.
         let common_modes =
             unsafe { kCFRunLoopCommonModes }.context("obtain kCFRunLoopCommonModes")?;
-        run_loop.add_source(Some(&source), Some(common_modes));
 
         {
             let mut state = queue_state
@@ -162,13 +161,24 @@ impl BluetoothMainThread {
             state.run_loop_address = std::ptr::from_ref(&*run_loop) as usize;
         }
 
+        // Publication is the final fallible startup operation. The command
+        // source and its stable context already exist, but the source is not
+        // installed in the run loop until publication and incoming-listener
+        // registration both succeed.
+        let endpoint = context
+            .actor
+            .publish()
+            .context("publish Bluetooth SPP service")?;
+        run_loop.add_source(Some(&source), Some(common_modes));
+
         Ok(Self {
             source,
             run_loop,
             context,
             queue: MainThreadCommandQueue { state: queue_state },
             local_address,
-            channel_id,
+            service_record_handle: endpoint.record_handle,
+            channel_id: endpoint.channel_id,
         })
     }
 
@@ -185,6 +195,11 @@ impl BluetoothMainThread {
     #[must_use]
     pub const fn channel_id(&self) -> u8 {
         self.channel_id
+    }
+
+    #[must_use]
+    pub const fn service_record_handle(&self) -> u32 {
+        self.service_record_handle
     }
 
     /// Run the native event loop until the actor's strict shutdown barrier is
@@ -230,7 +245,7 @@ unsafe extern "C-unwind" fn perform_commands(info: *mut c_void) {
             if let Ok(mut state) = context.queue.lock() {
                 state.buffer.close();
             }
-            autoreleasepool(|_| context.actor.shutdown());
+            autoreleasepool(|_| context.actor.handle(BtCommand::Shutdown));
             break;
         }
         autoreleasepool(|_| context.actor.handle(command));

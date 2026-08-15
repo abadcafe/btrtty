@@ -15,7 +15,7 @@ use objc2_io_bluetooth::{
 };
 use tokio::sync::mpsc;
 
-use super::close_barrier::{CloseAction, CloseBarrier, CloseCompletion, CloseRequest};
+use super::lifecycle::{Lifecycle, LifecycleAction};
 use super::sdp;
 use super::types::{BtCommand, BtError, BtEvent, DeviceAddress, WriteToken};
 
@@ -26,15 +26,26 @@ struct PendingWrite {
 
 struct ActiveChannel {
     channel: Retained<IOBluetoothRFCOMMChannel>,
+    close_notification: Option<Retained<IOBluetoothUserNotification>>,
+}
+
+struct RejectedChannel {
+    channel: Retained<IOBluetoothRFCOMMChannel>,
     close_notification: Retained<IOBluetoothUserNotification>,
+}
+
+pub(super) struct PublishedEndpoint {
+    pub(super) record_handle: u32,
+    pub(super) channel_id: u8,
 }
 
 struct ActorState {
     service_record: Option<Retained<IOBluetoothSDPServiceRecord>>,
     incoming_notification: Option<Retained<IOBluetoothUserNotification>>,
     active: Option<ActiveChannel>,
+    rejected: HashMap<usize, RejectedChannel>,
     pending_writes: HashMap<WriteToken, PendingWrite>,
-    close_barrier: CloseBarrier,
+    lifecycle: Lifecycle,
     fatal_error: Option<BtError>,
 }
 
@@ -44,8 +55,9 @@ impl Default for ActorState {
             service_record: None,
             incoming_notification: None,
             active: None,
+            rejected: HashMap::new(),
             pending_writes: HashMap::new(),
-            close_barrier: CloseBarrier::new(),
+            lifecycle: Lifecycle::new(),
             fatal_error: None,
         }
     }
@@ -185,7 +197,7 @@ impl BluetoothActor {
         unsafe { msg_send![super(this), init] }
     }
 
-    pub(super) fn publish(&self) -> Result<u8> {
+    pub(super) fn publish(&self) -> Result<PublishedEndpoint> {
         let service = sdp::publish()?;
         let object: &AnyObject = self;
         // SAFETY: The selector is implemented above with Apple's required
@@ -201,54 +213,47 @@ impl BluetoothActor {
         };
         let Some(notification) = notification else {
             // SAFETY: This process owns the freshly published record.
-            unsafe { service.record.removeServiceRecord() };
+            let rollback_status = unsafe { service.record.removeServiceRecord() };
+            if rollback_status != 0 {
+                bail!(
+                    "register incoming RFCOMM channel notification; SDP rollback failed with IOReturn {rollback_status:#x}"
+                );
+            }
             bail!("register incoming RFCOMM channel notification");
         };
 
         let mut state = self.ivars().state.borrow_mut();
+        if let Err(error) = state.lifecycle.service_published() {
+            drop(state);
+            // SAFETY: Neither freshly created registration has been installed
+            // in actor state, so this stack frame still owns both resources.
+            unsafe { notification.unregister() };
+            // SAFETY: This process owns the freshly published record.
+            let rollback_status = unsafe { service.record.removeServiceRecord() };
+            if rollback_status != 0 {
+                bail!("{error}; SDP rollback failed with IOReturn {rollback_status:#x}");
+            }
+            return Err(error);
+        }
         state.service_record = Some(service.record);
         state.incoming_notification = Some(notification);
-        Ok(service.channel_id)
+        Ok(PublishedEndpoint {
+            record_handle: service.record_handle,
+            channel_id: service.channel_id,
+        })
     }
 
     pub(super) fn handle(&self, command: BtCommand) {
         match command {
             BtCommand::Send { token, data } => self.send(token, data),
-            BtCommand::Close => self.begin_close(CloseRequest::Session),
-            BtCommand::Shutdown => self.shutdown(),
+            BtCommand::Close => self.begin_session_close(),
+            BtCommand::Shutdown => self.begin_shutdown(),
         }
-    }
-
-    pub(super) fn shutdown(&self) {
-        let (notification, record) = {
-            let mut state = self.ivars().state.borrow_mut();
-            (
-                state.incoming_notification.take(),
-                state.service_record.clone(),
-            )
-        };
-
-        // Withdraw the listener before touching the active channel. This makes
-        // it impossible for a new incoming channel to enter during teardown.
-        if let Some(notification) = notification {
-            // SAFETY: The actor owns this live registration.
-            unsafe { notification.unregister() };
-        }
-        if let Some(record) = record {
-            // SAFETY: The actor owns this published transient service.
-            let status = unsafe { record.removeServiceRecord() };
-            if status == 0 {
-                self.ivars().state.borrow_mut().service_record = None;
-            } else {
-                self.emit_error("remove SDP service", status);
-            }
-        }
-
-        self.begin_close(CloseRequest::Shutdown);
     }
 
     pub(super) fn finish(&self) -> Result<()> {
         let state = self.ivars().state.borrow();
+        state.lifecycle.ensure_stopped()?;
         if state.incoming_notification.is_some() {
             bail!("Bluetooth shutdown ended with an incoming listener registered");
         }
@@ -257,6 +262,9 @@ impl BluetoothActor {
         }
         if state.active.is_some() {
             bail!("Bluetooth shutdown ended before RFCOMM channel-close notification");
+        }
+        if !state.rejected.is_empty() {
+            bail!("Bluetooth shutdown ended with rejected RFCOMM channels still closing");
         }
         if !state.pending_writes.is_empty() {
             bail!("Bluetooth shutdown ended with RFCOMM writes outstanding");
@@ -274,11 +282,15 @@ impl BluetoothActor {
     ) {
         {
             let state = self.ivars().state.borrow();
-            if state.incoming_notification.as_deref() != Some(notification)
-                || state.active.is_some()
-            {
-                // SAFETY: This incoming channel was never installed as active.
-                unsafe { channel.closeChannel() };
+            if state.incoming_notification.as_deref() != Some(notification) {
+                drop(state);
+                self.reject_channel(channel);
+                self.emit_error("receive RFCOMM channel from unknown listener", -1);
+                return;
+            }
+            if state.active.is_some() {
+                drop(state);
+                self.reject_channel(channel);
                 return;
             }
         }
@@ -296,14 +308,12 @@ impl BluetoothActor {
             .and_then(|device| unsafe { device.addressString() })
             .and_then(|address| DeviceAddress::new(&address.to_string()).ok());
         let Some(device) = device else {
-            // SAFETY: The retained channel is valid and main-thread-owned.
-            unsafe { channel.closeChannel() };
+            self.reject_channel(&channel);
             self.emit_error("read client address", -1);
             return;
         };
         if mtu == 0 {
-            // SAFETY: The retained channel is valid and main-thread-owned.
-            unsafe { channel.closeChannel() };
+            self.reject_channel(&channel);
             self.emit_error("read RFCOMM MTU", -1);
             return;
         }
@@ -318,8 +328,10 @@ impl BluetoothActor {
             )
         };
         let Some(close_notification) = close_notification else {
-            // SAFETY: The channel was not exposed to the application.
-            unsafe { channel.closeChannel() };
+            self.close_untracked_channel(
+                &channel,
+                "close RFCOMM channel without close notification",
+            );
             self.emit_error("register RFCOMM channel-close notification", -1);
             return;
         };
@@ -330,8 +342,7 @@ impl BluetoothActor {
         if status != 0 {
             // SAFETY: This actor owns the close notification registration.
             unsafe { close_notification.unregister() };
-            // SAFETY: The channel was not exposed to the application.
-            unsafe { channel.closeChannel() };
+            self.reject_channel(&channel);
             self.emit_error("set RFCOMM delegate", status);
             return;
         }
@@ -340,20 +351,19 @@ impl BluetoothActor {
             .ivars()
             .state
             .borrow_mut()
-            .close_barrier
+            .lifecycle
             .channel_opened()
             .is_err()
         {
             // SAFETY: This actor still owns the unused registration.
             unsafe { close_notification.unregister() };
-            // SAFETY: This duplicate channel was never installed as active.
-            unsafe { channel.closeChannel() };
+            self.reject_channel(&channel);
             self.emit_error("open overlapping RFCOMM channel", -1);
             return;
         }
         self.ivars().state.borrow_mut().active = Some(ActiveChannel {
             channel: channel.clone(),
-            close_notification,
+            close_notification: Some(close_notification),
         });
 
         if self
@@ -366,7 +376,7 @@ impl BluetoothActor {
             })
             .is_err()
         {
-            self.begin_close(CloseRequest::Session);
+            self.begin_session_close();
         }
     }
 
@@ -375,26 +385,39 @@ impl BluetoothActor {
             self.emit_error("receive RFCOMM close without channel", -1);
             return;
         };
-        let completion = {
+        let closed = {
             let mut state = self.ivars().state.borrow_mut();
             let is_current = state
                 .active
                 .as_ref()
                 .is_some_and(|active| std::ptr::eq(active.channel.as_ref(), channel));
-            if !is_current {
-                return;
+            if is_current {
+                let active = state.active.as_mut().expect("active channel was checked");
+                let Some(close_notification) = active.close_notification.take() else {
+                    return;
+                };
+                (close_notification, state.lifecycle.channel_closed())
+            } else {
+                let key = Self::channel_key(channel);
+                let Some(rejected) = state.rejected.remove(&key) else {
+                    return;
+                };
+                debug_assert!(std::ptr::eq(rejected.channel.as_ref(), channel));
+                (
+                    rejected.close_notification,
+                    state.lifecycle.rejected_channel_closed(),
+                )
             }
-            let active = state.active.take().expect("active channel was checked");
-            // SAFETY: The callback proves the channel is closed, so this
-            // actor-owned registration is no longer needed.
-            unsafe { active.close_notification.unregister() };
-            state.pending_writes.clear();
-            state.close_barrier.channel_closed()
         };
 
-        match completion {
-            Ok(completion) => self.complete_close(completion),
-            Err(_) => self.emit_error("complete RFCOMM close barrier", -1),
+        // SAFETY: The callback proves the channel is closed. The RefCell
+        // borrow was released first so framework unregistration may not
+        // re-enter Rust while mutable actor state is borrowed.
+        unsafe { closed.0.unregister() };
+
+        match closed.1 {
+            Ok(action) => self.apply_lifecycle_action(action),
+            Err(_) => self.emit_error("complete RFCOMM close lifecycle", -1),
         }
     }
 
@@ -403,21 +426,28 @@ impl BluetoothActor {
             self.emit_error("encode RFCOMM write token", -1);
             return;
         };
+        let channel = self
+            .ivars()
+            .state
+            .borrow()
+            .active
+            .as_ref()
+            .map(|active| active.channel.clone());
+        let Some(channel) = channel else {
+            self.emit_error("write without RFCOMM client", -1);
+            return;
+        };
+        // SAFETY: The retained channel is main-thread-owned. No Rust actor
+        // state is borrowed while invoking the framework.
+        let mtu = usize::from(unsafe { channel.getMTU() });
+        if data.is_empty() || data.len() > mtu || data.len() > usize::from(u16::MAX) {
+            self.emit_error("invalid RFCOMM write length", -1);
+            return;
+        }
+
         let prepared = {
             let mut state = self.ivars().state.borrow_mut();
-            let Some(channel) = state.active.as_ref().map(|active| active.channel.clone()) else {
-                drop(state);
-                self.emit_error("write without RFCOMM client", -1);
-                return;
-            };
-            // SAFETY: The channel is open and main-thread-owned.
-            let mtu = usize::from(unsafe { channel.getMTU() });
-            if data.is_empty() || data.len() > mtu || data.len() > usize::from(u16::MAX) {
-                drop(state);
-                self.emit_error("invalid RFCOMM write length", -1);
-                return;
-            }
-            if state.close_barrier.write_started().is_err() {
+            if state.lifecycle.write_started().is_err() {
                 drop(state);
                 self.emit_error("overlapping or closing RFCOMM write", -1);
                 return;
@@ -428,19 +458,20 @@ impl BluetoothActor {
             state
                 .pending_writes
                 .insert(token, PendingWrite { token, data });
-            (channel, pointer, length)
+            (pointer, length)
         };
 
-        let (channel, pointer, length) = prepared;
+        let (pointer, length) = prepared;
         // SAFETY: `pointer` addresses Bytes retained in `pending_writes` until
-        // the matching completion or actual channel-close callback.
+        // the matching write-completion callback. A channel-close callback by
+        // itself never releases the buffer.
         let status =
             unsafe { channel.writeAsync_length_refcon(pointer, length, refcon as *mut c_void) };
         if status != 0 {
             let action = {
                 let mut state = self.ivars().state.borrow_mut();
                 state.pending_writes.remove(&token);
-                state.close_barrier.write_completed()
+                state.lifecycle.write_completed()
             };
             let _ = self.ivars().events.send(BtEvent::WriteComplete {
                 token,
@@ -448,7 +479,7 @@ impl BluetoothActor {
                 status,
             });
             match action {
-                Ok(action) => self.apply_close_action(action),
+                Ok(action) => self.apply_lifecycle_action(action),
                 Err(_) => self.emit_error("roll back rejected RFCOMM write", -1),
             }
         }
@@ -463,9 +494,7 @@ impl BluetoothActor {
         let (pending, action) = {
             let mut state = self.ivars().state.borrow_mut();
             let pending = state.pending_writes.remove(&token);
-            let action = pending
-                .as_ref()
-                .map(|_| state.close_barrier.write_completed());
+            let action = pending.as_ref().map(|_| state.lifecycle.write_completed());
             (pending, action)
         };
         let Some(pending) = pending else {
@@ -480,37 +509,76 @@ impl BluetoothActor {
             status,
         });
         match action.expect("pending write has a barrier transition") {
-            Ok(action) => self.apply_close_action(action),
+            Ok(action) => self.apply_lifecycle_action(action),
             Err(_) => self.emit_error("complete RFCOMM write barrier", -1),
         }
     }
 
-    fn begin_close(&self, request: CloseRequest) {
+    fn begin_session_close(&self) {
         let action = self
             .ivars()
             .state
             .borrow_mut()
-            .close_barrier
-            .begin_close(request);
-        self.apply_close_action(action);
+            .lifecycle
+            .begin_session_close();
+        match action {
+            Ok(action) => self.apply_lifecycle_action(action),
+            Err(_) => self.emit_error("begin RFCOMM session close", -1),
+        }
     }
 
-    fn apply_close_action(&self, action: CloseAction) {
+    fn begin_shutdown(&self) {
+        let action = self.ivars().state.borrow_mut().lifecycle.begin_shutdown();
+        if let Ok(action) = action {
+            self.apply_lifecycle_action(action);
+        } else {
+            self.emit_error("begin Bluetooth shutdown", -1);
+            Self::stop_run_loop();
+        }
+    }
+
+    fn apply_lifecycle_action(&self, action: LifecycleAction) {
         match action {
-            CloseAction::Wait => {}
-            CloseAction::CloseChannel => self.submit_channel_close(),
-            CloseAction::Complete(completion) => self.complete_close(completion),
+            LifecycleAction::Wait => {}
+            LifecycleAction::CloseChannel => self.submit_channel_close(),
+            LifecycleAction::NotifyDisconnected => {
+                if let Err(error) = self.release_closed_active() {
+                    self.emit_error(error, -1);
+                    Self::stop_run_loop();
+                    return;
+                }
+                let _ = self.ivars().events.send(BtEvent::Disconnected);
+            }
+            LifecycleAction::WithdrawService => {
+                if self.ivars().state.borrow().active.is_some()
+                    && let Err(error) = self.release_closed_active()
+                {
+                    self.emit_error(error, -1);
+                    Self::stop_run_loop();
+                    return;
+                }
+                self.withdraw_service();
+            }
+            LifecycleAction::StopRunLoop => Self::stop_run_loop(),
         }
     }
 
     fn submit_channel_close(&self) {
-        let channel = self
-            .ivars()
-            .state
-            .borrow()
-            .active
-            .as_ref()
-            .map(|active| active.channel.clone());
+        let channel = {
+            let state = self.ivars().state.borrow();
+            if !state.pending_writes.is_empty() {
+                drop(state);
+                self.emit_error("close RFCOMM channel with write outstanding", -1);
+                Self::stop_run_loop();
+                return;
+            }
+            state.active.as_ref().and_then(|active| {
+                active
+                    .close_notification
+                    .as_ref()
+                    .map(|_| active.channel.clone())
+            })
+        };
         let Some(channel) = channel else {
             self.emit_error("close missing RFCOMM channel", -1);
             Self::stop_run_loop();
@@ -525,24 +593,147 @@ impl BluetoothActor {
         }
         self.emit_error("close RFCOMM channel", status);
 
-        // A failed RFCOMM close submission cannot satisfy the barrier. Ask the
-        // owning device connection to close, then still wait for the channel
-        // callback. If even that request fails, exit explicitly with failure.
-        let fallback =
-            unsafe { channel.getDevice() }.map_or(-1, |device| unsafe { device.closeConnection() });
-        if fallback != 0 {
-            self.emit_error("close Bluetooth device connection", fallback);
+        // Do not close the device-wide ACL as a fallback: it is shared with
+        // unrelated profiles such as HFP and A2DP. Keep ownership and wait for
+        // a real remote close callback instead of pretending the close barrier
+        // completed. The process exits with this recorded error after cleanup.
+    }
+
+    fn withdraw_service(&self) {
+        let record = self.ivars().state.borrow().service_record.clone();
+        let Some(record) = record else {
+            self.emit_error("remove missing SDP service", -1);
+            Self::stop_run_loop();
+            return;
+        };
+
+        // SAFETY: Every application-visible and rejected RFCOMM channel has
+        // produced its close callback before the lifecycle allows this action.
+        let status = unsafe { record.removeServiceRecord() };
+        if status != 0 {
+            self.emit_error("remove SDP service", status);
+            Self::stop_run_loop();
+            return;
+        }
+
+        let notification = {
+            let mut state = self.ivars().state.borrow_mut();
+            state.service_record = None;
+            let Some(notification) = state.incoming_notification.take() else {
+                drop(state);
+                self.emit_error("unregister missing RFCOMM listener", -1);
+                Self::stop_run_loop();
+                return;
+            };
+            notification
+        };
+
+        // SAFETY: Service removal succeeded and the actor owns this live
+        // incoming-channel registration. The RefCell borrow was released
+        // before the framework call. Human operation guarantees no new remote
+        // connection attempt during final shutdown.
+        unsafe { notification.unregister() };
+        let action = self
+            .ivars()
+            .state
+            .borrow_mut()
+            .lifecycle
+            .service_withdrawn();
+
+        if let Ok(action) = action {
+            self.apply_lifecycle_action(action);
+        } else {
+            self.emit_error("complete Bluetooth service withdrawal", -1);
             Self::stop_run_loop();
         }
     }
 
-    fn complete_close(&self, completion: CloseCompletion) {
-        match completion {
-            CloseCompletion::Remote | CloseCompletion::Session => {
-                let _ = self.ivars().events.send(BtEvent::Disconnected);
-            }
-            CloseCompletion::Shutdown => Self::stop_run_loop(),
+    fn release_closed_active(&self) -> Result<(), &'static str> {
+        let mut state = self.ivars().state.borrow_mut();
+        let Some(active) = state.active.as_ref() else {
+            return Err("release missing closed RFCOMM channel");
+        };
+        if active.close_notification.is_some() {
+            return Err("release RFCOMM channel before close callback");
         }
+        if !state.pending_writes.is_empty() {
+            return Err("release RFCOMM channel before write completion");
+        }
+        state.active = None;
+        Ok(())
+    }
+
+    fn reject_channel(&self, channel: &IOBluetoothRFCOMMChannel) {
+        let channel = IOBluetoothRFCOMMChannel::retain(channel);
+        let object: &AnyObject = self;
+        // SAFETY: The selector has Apple's `(notification, channel)` shape and
+        // the rejected channel is retained until its close callback.
+        let close_notification = unsafe {
+            channel.registerForChannelCloseNotification_selector(
+                Some(object),
+                Some(sel!(rfcommChannelClosedNotification:channel:)),
+            )
+        };
+        let Some(close_notification) = close_notification else {
+            self.close_untracked_channel(
+                &channel,
+                "close rejected RFCOMM channel without close notification",
+            );
+            self.emit_error("register rejected RFCOMM close notification", -1);
+            return;
+        };
+
+        let key = Self::channel_key(&channel);
+        let mut close_notification = Some(close_notification);
+        let installed = {
+            let mut state = self.ivars().state.borrow_mut();
+            if state.rejected.contains_key(&key)
+                || state.lifecycle.rejected_channel_opened().is_err()
+            {
+                false
+            } else {
+                state.rejected.insert(
+                    key,
+                    RejectedChannel {
+                        channel: channel.clone(),
+                        close_notification: close_notification
+                            .take()
+                            .expect("close notification is consumed once"),
+                    },
+                );
+                true
+            }
+        };
+        if !installed {
+            if let Some(close_notification) = close_notification {
+                // SAFETY: The rejected channel was never installed, so this
+                // registration remains locally owned.
+                unsafe { close_notification.unregister() };
+            }
+            self.close_untracked_channel(&channel, "close untracked duplicate RFCOMM channel");
+            self.emit_error("track rejected RFCOMM channel", -1);
+            return;
+        }
+
+        // SAFETY: Ownership and close notification were installed before the
+        // close request, including if the callback is delivered synchronously.
+        let status = unsafe { channel.closeChannel() };
+        if status != 0 {
+            self.emit_error("close rejected RFCOMM channel", status);
+        }
+    }
+
+    fn close_untracked_channel(&self, channel: &IOBluetoothRFCOMMChannel, operation: &'static str) {
+        // SAFETY: This is a borrowed open channel delivered on the actor's
+        // native main thread. No global ACL fallback is attempted.
+        let status = unsafe { channel.closeChannel() };
+        if status != 0 {
+            self.emit_error(operation, status);
+        }
+    }
+
+    fn channel_key(channel: &IOBluetoothRFCOMMChannel) -> usize {
+        std::ptr::from_ref(channel) as usize
     }
 
     fn is_active_channel(&self, channel: Option<&IOBluetoothRFCOMMChannel>) -> bool {

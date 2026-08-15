@@ -12,7 +12,7 @@ cargo clippy --all-targets --all-features -- -D warnings
 ./scripts/package.sh
 ```
 
-- 38 项测试通过。
+- 46 项模块/单元测试与 2 项二进制元数据测试通过。
 - 单文件 Mach-O 内嵌稳定 `CFBundleIdentifier` 和 `NSBluetoothAlwaysUsageDescription`，无 App Bundle。
 - RFCOMM 与 PTY 之间没有握手、控制帧或 payload 转换。
 - PTY 往返保持 UTF-8、NUL、ESC/方向键序列原始字节。
@@ -26,25 +26,27 @@ cargo clippy --all-targets --all-features -- -D warnings
 - 取消会 kill/reap PTY child。
 - 未配对的 Bluetooth 连接在创建 PTY 前收到 `Close`；已配对连接不额外要求链路加密。
 - 单实例锁会拒绝第二个 live btrtty，并在 owner 退出后允许重新获取。
-- 关闭屏障状态机已覆盖：等待 outstanding write、等待实际 channel-close callback、session close 升级为 shutdown、remote close 后允许下一连接。
+- Bluetooth 生命周期状态机已覆盖：等待 outstanding write、等待 active/rejected channel 的实际 close callback、session close 升级为 shutdown、channel 全部关闭后才允许移除 SDP，以及 SDP 移除后才允许停止 CFRunLoop。
+- 启动路径只发布一次 SDP；所有可失败的 CFRunLoop 基础设施先于 publication 创建，incoming notification 注册失败必须检查 SDP rollback。
+- 删除了 device-wide `closeConnection()` fallback、自动 drain、固定延时和启动时 publish-remove-republish 伪清理。
 
-## 本机 Bluetooth smoke test
+## 本机 Bluetooth smoke test（当前二进制待重测）
 
-本机（Bluetooth 地址 `10:B5:88:4D:11:18`）成功发布标准 SPP service，IOBluetooth 动态分配 RFCOMM channel 1：
+本机 Bluetooth controller 的历史测试地址是 `10:B5:88:4D:11:18`。当前二进制启动后预期输出以下字段；record handle 和 RFCOMM channel 均必须以当次实际输出为准：
 
 ```text
-Published Bluetooth Serial Port
+Registered Bluetooth Serial Port
 Bluetooth address: 10:B5:88:4D:11:18
+SDP record handle: 0x4F491101
 RFCOMM channel: 1
 Waiting for paired client...
 ```
 
-- [x] macOS Bluetooth TCC 授权通过。
-- [x] 启动输出显示本机 Bluetooth controller address。
-- [x] 标准 SPP SDP record 发布成功并取得动态 RFCOMM channel。
-- [x] SIGINT/SIGTERM 正常退出，随后可立即重新发布同一服务。
-- [x] 重复发布/停止没有残留进程或 channel registration 冲突。
-- [x] 第二个 btrtty 实例在发布 SDP 前被排他锁拒绝。
+- [ ] 当前签名二进制通过 macOS Bluetooth TCC 授权。
+- [ ] 启动输出显示本机 Bluetooth controller address。
+- [ ] 标准 SPP SDP record 发布成功并取得非零 record handle 与动态 RFCOMM channel。
+- [ ] 无 active client 时 SIGINT/SIGTERM 按 SDP removal → listener unregister 顺序退出。
+- [ ] 第二个 btrtty 实例在发布 SDP 前被排他锁拒绝。
 
 ## 当前环境阻塞项
 
@@ -92,7 +94,8 @@ picocom -b 115200 --flow n /dev/rfcomm0
 - [ ] tmux 内 24-bit 色块正常，无颜色降级。
 - [ ] Linux disconnect 后 Mac 不 crash，并返回 waiting。
 - [ ] reconnect 后重新出现 shell。
-- [ ] client 连接期间对 Mac btrtty 发 SIGINT：Mac 等到 Linux `/dev/rfcomm0` 实际断开后才退出；立即启动新 btrtty 并连接，不出现 `Connection refused`。
+- [ ] 先停止 Linux 自动重试但保持一个 active client，再对 Mac btrtty 发 SIGINT：Mac 等 outstanding write 和真实 channel-close callback，随后才移除 SDP/listener；Linux `/dev/rfcomm0` 被断开。
+- [ ] Linux 执行 `rfcomm release` 并确认没有新连接进程后，停止并重新启动 btrtty；重新连接不出现 `Connection refused`。
 - [ ] 连续执行 20 次 connect → disconnect → reconnect，不需要重启 btrtty、开关 Bluetooth controller 或清理 macOS 全局蓝牙状态。
 - [ ] tmux reconnect 后 session 内容保留。
 - [ ] `yes` 大量输出时 RSS 稳定在有界范围，停止后能恢复交互。
@@ -100,6 +103,12 @@ picocom -b 115200 --flow n /dev/rfcomm0
 - [ ] 连续输出及立即重连后的输出按配置的 KiB/s 调度，reconnect 不重置尚未到期的发送进度。
 - [ ] 未配对设备不能得到 shell。
 - [ ] 从 Mac 配对列表移除设备后，该设备 reconnect 被拒绝。
-- [x] SIGINT/SIGTERM 后进程干净退出，服务可立即重新发布。
+- [ ] 保存 btrtty stderr 与 macOS Bluetooth 日志，确认最终关闭严格按照 channel-close callback → remove SDP → listener unregister 顺序发生。
 
 最后检查默认日志中没有 terminal payload，并保存 Mac 版本、Linux 发行版、BlueZ 版本、Bluetooth adapter 型号和实际 RFCOMM channel。
+
+## 人工前置条件与平台边界
+
+最终停止 btrtty 前，操作者负责停止 Linux 上所有新的 RFCOMM connect/retry。IOBluetooth 没有公开接口枚举 `bluetoothd` 中尚未打开、尚未交付给应用的 pending incoming connection；本验收不声称程序能够自动 drain 该不可见状态。
+
+启动时只允许创建并回滚本次进程拥有的资源。禁止关闭设备级 ACL、删除配对关系、切换 Bluetooth controller、杀死 `bluetoothd`、删除系统偏好文件或执行 publish-remove-republish 清理循环。若历史版本已经污染 daemon 状态，先人工关闭/打开一次 macOS Bluetooth，再开始本清单。

@@ -13,6 +13,7 @@ const SPP_VERSION_1_2: u16 = 0x0102;
 
 pub(super) struct PublishedService {
     pub(super) record: Retained<IOBluetoothSDPServiceRecord>,
+    pub(super) record_handle: u32,
     pub(super) channel_id: u8,
 }
 
@@ -29,12 +30,38 @@ pub(super) fn publish() -> Result<PublishedService> {
     // SAFETY: `channel_id` is a valid out pointer for the duration of the call.
     let status = unsafe { record.getRFCOMMChannelID(std::ptr::from_mut(&mut channel_id)) };
     if status != 0 || channel_id == 0 {
-        // SAFETY: The record was just published by this process.
-        unsafe { record.removeServiceRecord() };
+        rollback_publication(&record, "read dynamically assigned RFCOMM channel", status)?;
         bail!("read dynamically assigned RFCOMM channel: IOReturn {status:#x}");
     }
 
-    Ok(PublishedService { record, channel_id })
+    let mut record_handle = 0_u32;
+    // SAFETY: `record_handle` is a valid out pointer for the duration of the call.
+    let status = unsafe { record.getServiceRecordHandle(std::ptr::from_mut(&mut record_handle)) };
+    if status != 0 || record_handle == 0 {
+        rollback_publication(&record, "read SDP service record handle", status)?;
+        bail!("read SDP service record handle: IOReturn {status:#x}");
+    }
+
+    Ok(PublishedService {
+        record,
+        record_handle,
+        channel_id,
+    })
+}
+
+fn rollback_publication(
+    record: &IOBluetoothSDPServiceRecord,
+    operation: &'static str,
+    status: i32,
+) -> Result<()> {
+    // SAFETY: This process owns the record created by the failed publication.
+    let rollback_status = unsafe { record.removeServiceRecord() };
+    if rollback_status != 0 {
+        bail!(
+            "{operation}: IOReturn {status:#x}; SDP rollback failed with IOReturn {rollback_status:#x}"
+        );
+    }
+    Ok(())
 }
 
 pub(super) fn build_service_dictionary() -> Result<Retained<NSMutableDictionary>> {
