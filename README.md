@@ -26,7 +26,8 @@ macOS main thread                 Tokio runtime（2 workers）
 - data callback 只复制 payload 并尝试写入有界输入通道；close、flow-control 和 write-completion callback 只投递 native action，其中可重复的 flow/input-overflow hint 会合并。incoming-open callback 只建立 channel 所有权、delegate 和 close notification；所有应用状态转换都在 callback 栈外执行。任何 callback 都不操作 PTY、不等待、不执行 shell。
 - Tokio 命令经 `CFRunLoopSourceSignal` + `CFRunLoopWakeUp` 送回主线程，无轮询。
 - 每条连接都有不可复用的 `ConnectionId`；`Send`、`Close`、write completion、input 和 disconnect 全部带连接 ID。旧连接的延迟事件/命令不能命中新连接。首次 acceptance 在 listener publication 前已经 armed；之后只有上一条连接的真实 close callback 才能产生一次性的 reconnect permit。
-- RFCOMM 只使用 `writeAsync`，每次不超过 MTU，同时最多 4 个 outstanding writes。
+- RFCOMM 只使用 `writeAsync`，每次不超过 MTU，同时最多 8 个 outstanding writes。
+- PTY 短读会在最多 1 ms 的绝对窗口内合并到 MTU 大小，减少 Vim 等全屏程序产生的小包；超时不会因后续碎片而延长，字节内容和顺序不变。
 - SDP record 和 incoming listener 与长期运行的 btrtty 进程同寿命；普通 client disconnect 只销毁本次 PTY/bash，绝不重新发布 Bluetooth 服务。
 - 每个 active channel 都注册独立的 channel-close notification；actor 必须同时收到全部 outstanding write completions 和真实 channel-close callback，才会释放 channel 与 pending `Bytes`，这些事件无论以什么顺序到达都不能越过另一道屏障。超过单 active-client 限制的已打开 channel 也会被保留并等待真实 close callback，不会直接丢弃 Objective-C 对象。
 - 最终关闭顺序固定为：停止 PTY 和新 write → 等待全部 outstanding writes → 请求关闭已知 channel → 等待全部 channel-close callbacks → 删除 SDP record → 注销 incoming notification → 停止 CFRunLoop。不得提前报告 native shutdown 完成。

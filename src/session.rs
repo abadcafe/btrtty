@@ -1,4 +1,5 @@
 mod input;
+mod output;
 mod pty;
 mod tx;
 
@@ -6,7 +7,6 @@ use std::pin::Pin;
 
 use anyhow::{Context, Result, anyhow, bail};
 use bytes::Bytes;
-use tokio::io::AsyncReadExt;
 use tokio::sync::mpsc;
 use tokio::task::JoinHandle;
 use tokio::time::{Instant, Sleep};
@@ -155,23 +155,22 @@ pub async fn run_session<S: BluetoothSink>(
 }
 
 fn spawn_reader(
-    mut reader: pty_process::OwnedReadPty,
+    reader: pty_process::OwnedReadPty,
     output: mpsc::Sender<Bytes>,
     chunk_size: usize,
     cancel: CancellationToken,
 ) -> JoinHandle<std::io::Result<()>> {
     tokio::spawn(async move {
-        let mut buffer = vec![0_u8; chunk_size];
+        let mut reader = output::OutputReader::new(reader, chunk_size)?;
         loop {
-            let count = tokio::select! {
+            let chunk = tokio::select! {
                 biased;
                 () = cancel.cancelled() => return Ok(()),
-                result = reader.read(&mut buffer) => result?,
+                result = reader.read_chunk() => result?,
             };
-            if count == 0 {
+            let Some(chunk) = chunk else {
                 return Ok(());
-            }
-            let chunk = Bytes::copy_from_slice(&buffer[..count]);
+            };
             tokio::select! {
                 biased;
                 () = cancel.cancelled() => return Ok(()),
@@ -359,5 +358,7 @@ fn submit_write<S: BluetoothSink>(
     })
 }
 
+#[cfg(test)]
+mod output_tests;
 #[cfg(test)]
 mod tx_tests;

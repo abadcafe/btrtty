@@ -28,18 +28,18 @@ fn test_tx_window_splits_chunks_at_mtu() {
 }
 
 #[test]
-fn test_tx_window_keeps_four_outstanding_writes() {
+fn test_tx_window_keeps_eight_outstanding_writes() {
     let mut window = TxWindow::new(4).unwrap();
     window
-        .enqueue(Bytes::from_static(b"abcdefghijklmnopq"))
+        .enqueue(Bytes::from_static(b"abcdefghijklmnopqrstuvwxyzabcdefg"))
         .unwrap();
-    let writes = (0..4)
+    let writes = (0..8)
         .map(|_| window.start_write().unwrap())
         .collect::<Vec<_>>();
 
     assert_eq!(
         writes.iter().map(|write| write.data.len()).sum::<usize>(),
-        16
+        32
     );
     assert!(window.start_write().is_none());
     assert!(!window.is_drained());
@@ -47,11 +47,19 @@ fn test_tx_window_keeps_four_outstanding_writes() {
     assert!(window.enqueue(Bytes::from_static(b"later")).is_err());
 
     window
-        .complete(writes[2].token, writes[2].data.len())
+        .complete(writes[4].token, writes[4].data.len())
         .unwrap();
     let final_write = window.start_write().unwrap();
-    assert_eq!(&final_write.data[..], b"q");
-    for write in [writes[3].token, writes[0].token, writes[1].token] {
+    assert_eq!(&final_write.data[..], b"g");
+    for write in [
+        writes[7].token,
+        writes[0].token,
+        writes[3].token,
+        writes[1].token,
+        writes[6].token,
+        writes[2].token,
+        writes[5].token,
+    ] {
         window.complete(write, 4).unwrap();
     }
     window.complete(final_write.token, 1).unwrap();

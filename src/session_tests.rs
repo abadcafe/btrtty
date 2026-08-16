@@ -409,7 +409,7 @@ async fn test_run_session_limits_sustained_output() {
 }
 
 #[tokio::test]
-async fn test_run_session_submits_four_writes_before_completion() {
+async fn test_run_session_submits_eight_writes_before_completion() {
     let connection = connection(11);
     let sink = ObservableSink::default();
     let observer = sink.clone();
@@ -432,7 +432,7 @@ async fn test_run_session_submits_four_writes_before_completion() {
     );
     let drive = async move {
         let mut outstanding = Vec::new();
-        while outstanding.len() < 4 {
+        while outstanding.len() < 8 {
             for command in next_commands(&observer).await {
                 if let BtCommand::Send { token, data, .. } = command {
                     assert!(!data.is_empty());
@@ -451,7 +451,7 @@ async fn test_run_session_submits_four_writes_before_completion() {
         tokio::join!(session, drive)
     })
     .await
-    .expect("four-write RFCOMM window timed out");
+    .expect("eight-write RFCOMM window timed out");
     assert_eq!(result.unwrap(), SessionEnd::Disconnected);
 }
 
