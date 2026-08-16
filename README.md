@@ -26,16 +26,16 @@ macOS main thread                 Tokio runtime（2 workers）
 - data callback 只复制 payload 并尝试写入有界输入通道；close、flow-control 和 write-completion callback 只投递 native action，其中可重复的 flow/input-overflow hint 会合并。incoming-open callback 只建立 channel 所有权、delegate 和 close notification；所有应用状态转换都在 callback 栈外执行。任何 callback 都不操作 PTY、不等待、不执行 shell。
 - Tokio 命令经 `CFRunLoopSourceSignal` + `CFRunLoopWakeUp` 送回主线程，无轮询。
 - 每条连接都有不可复用的 `ConnectionId`；`Send`、`Close`、write completion、input 和 disconnect 全部带连接 ID。旧连接的延迟事件/命令不能命中新连接。首次 acceptance 在 listener publication 前已经 armed；之后只有上一条连接的真实 close callback 才能产生一次性的 reconnect permit。
-- RFCOMM 只使用 `writeAsync`，每次不超过 MTU，同时最多一个 outstanding write。
+- RFCOMM 只使用 `writeAsync`，每次不超过 MTU，同时最多 4 个 outstanding writes。
 - SDP record 和 incoming listener 与长期运行的 btrtty 进程同寿命；普通 client disconnect 只销毁本次 PTY/bash，绝不重新发布 Bluetooth 服务。
-- 每个 active channel 都注册独立的 channel-close notification；actor 必须同时收到 outstanding write completion 和真实 channel-close callback，才会释放 channel 与 pending `Bytes`，两个事件无论谁先到都不能越过另一道屏障。超过单 active-client 限制的已打开 channel 也会被保留并等待真实 close callback，不会直接丢弃 Objective-C 对象。
-- 最终关闭顺序固定为：停止 PTY 和新 write → 等待 outstanding write → 请求关闭已知 channel → 等待全部 channel-close callback → 删除 SDP record → 注销 incoming notification → 停止 CFRunLoop。不得提前报告 native shutdown 完成。
+- 每个 active channel 都注册独立的 channel-close notification；actor 必须同时收到全部 outstanding write completions 和真实 channel-close callback，才会释放 channel 与 pending `Bytes`，这些事件无论以什么顺序到达都不能越过另一道屏障。超过单 active-client 限制的已打开 channel 也会被保留并等待真实 close callback，不会直接丢弃 Objective-C 对象。
+- 最终关闭顺序固定为：停止 PTY 和新 write → 等待全部 outstanding writes → 请求关闭已知 channel → 等待全部 channel-close callbacks → 删除 SDP record → 注销 incoming notification → 停止 CFRunLoop。不得提前报告 native shutdown 完成。
 - `closeChannel()` 提交失败时不会用设备级 ACL 关闭兜底，也不会假装 channel 已关闭；actor 保留所有权并继续等远端真实 close callback，完成资源清理后以错误状态退出。
 - IOBluetooth 不提供枚举或取消 pre-open pending incoming connection 的公开 API。SIGINT/SIGTERM 的明确前置条件是操作者先停止 Linux 侧所有新连接和自动重试；btrtty 不包含虚假的 drain、延时轮询或 publish-remove-republish 清理。
 - 进程持有排他单实例锁；第二个 btrtty 会直接报错，不会与旧 listener 竞争或尝试接管其 channel。
 - 启动只发布一次 transient SDP record。所有可能失败的 CFRunLoop 基础设施在发布前创建；notification 注册失败时必须成功回滚本次 SDP record，否则启动直接报错。
-- Mac→Linux 默认限制为 20 KiB/s；空闲不会积累 burst，最多首个 `256 B` PTY chunk 立即发送，调度进度跨 Bluetooth 重连保留。
-- PTY output 使用 `256 B` chunk，bounded queue 按限速值容纳约 100 ms 输出；下游变慢时通过 PTY/kernel 自然反压，不丢字符。
+- Mac→Linux 默认限制为 20 KiB/s；空闲不会积累 burst，最多首个 RFCOMM MTU chunk 立即发送，调度进度跨 Bluetooth 重连保留。
+- PTY output 直接以当前 RFCOMM MTU 为最大 chunk，bounded queue 按限速值容纳约 100 ms 输出；下游变慢时通过 PTY/kernel 自然反压，不丢字符。
 - Linux→Mac payload 使用独立的 `128` 条 bounded input queue；队列满会关闭当前连接，不会无限增长。断线/退出会取消正在等待 PTY 可写的 future，旧连接残留输入在重新开放 accept gate 前清空。
 - SIGINT/SIGTERM handler 在 SDP publication 前完成安装。Tokio application task 即使 panic，watchdog 也会请求 native shutdown；PTY reader、child reap 和 native teardown 的错误均会返回，不会静默吞掉。
 
@@ -93,11 +93,11 @@ dist/btrtty \
   --command '/opt/homebrew/bin/tmux -T RGB new-session -A -s btrtty'
 ```
 
-`--max-output-rate` 的单位是 KiB/s，取值范围为 `1..=200`，只限制 Mac→Linux 的输出。空闲期间不会积累发送额度；空闲后的首个至多 `256 B` PTY chunk 可以立即发送，后续 chunk 按配置速率调度。限速器属于整个进程，重连不会重置尚未到期的发送进度。
+`--max-output-rate` 的单位是 KiB/s，取值范围为 `1..=200`，只限制 Mac→Linux 的输出。空闲期间不会积累发送额度；空闲后的首个至多 RFCOMM MTU 大小的 chunk 可以立即发送，后续 chunk 按配置速率调度。限速器属于整个进程，重连不会重置尚未到期的发送进度。
 
-PTY output queue 根据该参数动态容纳约 100 ms 的数据：在 1、20（默认）和 200 KiB/s 下分别为 `1 × 256 B`、`8 × 256 B` 和 `80 × 256 B`。这是有界反压队列，不是额外的可立即发送额度。
+PTY output queue 根据该参数和实际 MTU 动态容纳约 100 ms 的数据：容量为 `ceil(rate × 1024 × 100 ms / MTU)` 个 chunk，且最少为 1。这是有界反压队列，不是额外的可立即发送额度。
 
-默认值是 `exec /bin/bash -l`、24 行、80 列（即通常所说的 `80×24`）和 20 KiB/s。正常启动会显示系统动态分配的 RFCOMM channel：
+默认值是 `exec /bin/bash -l`、24 行、80 列（即通常所说的 `80×24`）和 20 KiB/s。每次客户端连接创建的新 PTY 都以当前用户的 `$HOME` 为初始工作目录；`$HOME` 缺失或无效时会话创建失败。正常启动会显示系统动态分配的 RFCOMM channel：
 
 ```text
 Registered Bluetooth Serial Port
@@ -107,7 +107,7 @@ RFCOMM channel: 11
 Waiting for paired client...
 ```
 
-客户端断开时，btrtty 必须同时等到 outstanding write completion（若存在）和 IOBluetooth 的实际 channel-close callback，随后才销毁本次 PTY 并重新进入等待；SDP/listener 全程不动。SIGINT/SIGTERM 也必须跨过这两道屏障，之后才依次删除 SDP、注销 listener 并退出。
+客户端断开时，btrtty 必须同时等到全部 outstanding write completions（若存在）和 IOBluetooth 的实际 channel-close callback，随后才销毁本次 PTY 并重新进入等待；SDP/listener 全程不动。SIGINT/SIGTERM 也必须跨过这两道屏障，之后才依次删除 SDP、注销 listener 并退出。
 
 ### 长期运行与退出契约
 

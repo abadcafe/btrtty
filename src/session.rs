@@ -16,8 +16,6 @@ use crate::bluetooth::{BtCommand, BtError, BtEvent, BtInput, ConnectionId};
 use crate::egress::EgressLimiter;
 use tx::{TxWindow, TxWrite};
 
-const PTY_CHUNK_SIZE: usize = 256;
-
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct SessionConfig {
     command: String,
@@ -113,11 +111,12 @@ pub async fn run_session<S: BluetoothSink>(
         mtu,
         shutdown,
     } = request;
-    let output_capacity = egress.queue_capacity(PTY_CHUNK_SIZE)?;
+    let window = TxWindow::new(mtu)?;
+    let output_capacity = egress.queue_capacity(mtu)?;
     let mut process = pty::spawn(&config).context("spawn PTY session")?;
     let (output_tx, mut output_rx) = mpsc::channel(output_capacity);
     let reader_cancel = shutdown.child_token();
-    let reader = spawn_reader(process.reader, output_tx, reader_cancel.clone());
+    let reader = spawn_reader(process.reader, output_tx, mtu, reader_cancel.clone());
 
     let session_result = {
         let mut bridge_state = Bridge {
@@ -129,7 +128,7 @@ pub async fn run_session<S: BluetoothSink>(
             shutdown: &shutdown,
             connection,
         };
-        let bridge = bridge_state.run(mtu);
+        let bridge = bridge_state.run(window);
         let input_pump = input::pump(input, connection, &mut process.writer);
         tokio::pin!(bridge, input_pump);
 
@@ -158,10 +157,11 @@ pub async fn run_session<S: BluetoothSink>(
 fn spawn_reader(
     mut reader: pty_process::OwnedReadPty,
     output: mpsc::Sender<Bytes>,
+    chunk_size: usize,
     cancel: CancellationToken,
 ) -> JoinHandle<std::io::Result<()>> {
     tokio::spawn(async move {
-        let mut buffer = vec![0_u8; PTY_CHUNK_SIZE];
+        let mut buffer = vec![0_u8; chunk_size];
         loop {
             let count = tokio::select! {
                 biased;
@@ -233,8 +233,7 @@ struct Bridge<'a, S> {
 }
 
 impl<S: BluetoothSink> Bridge<'_, S> {
-    async fn run(&mut self, mtu: usize) -> Result<SessionEnd> {
-        let mut window = TxWindow::new(mtu)?;
+    async fn run(&mut self, mut window: TxWindow) -> Result<SessionEnd> {
         let mut scheduled_write = None;
         let send_timer = tokio::time::sleep_until(Instant::now());
         tokio::pin!(send_timer);
@@ -310,6 +309,14 @@ impl<S: BluetoothSink> Bridge<'_, S> {
                         bail!("send timer fired without a scheduled RFCOMM write");
                     };
                     submit_write(self.bluetooth, self.connection, write)?;
+                    schedule_next(
+                        &mut window,
+                        self.egress,
+                        &mut scheduled_write,
+                        send_timer.as_mut(),
+                        self.bluetooth,
+                        self.connection,
+                    )?;
                 }
             }
         }
@@ -325,15 +332,16 @@ fn schedule_next<S: BluetoothSink>(
     connection: ConnectionId,
 ) -> Result<()> {
     if scheduled_write.is_some() {
-        bail!("cannot schedule overlapping RFCOMM writes");
+        return Ok(());
     }
-    if let Some(write) = window.start_write() {
+    while let Some(write) = window.start_write() {
         let deadline = egress.reserve(write.data.len())?;
         if deadline <= Instant::now() {
             submit_write(bluetooth, connection, write)?;
         } else {
             *scheduled_write = Some(write);
             send_timer.as_mut().reset(deadline);
+            break;
         }
     }
     Ok(())

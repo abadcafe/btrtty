@@ -48,6 +48,25 @@ fn test_begin_shutdown_waits_for_write_before_channel_close() {
 }
 
 #[test]
+fn test_begin_shutdown_waits_for_all_outstanding_writes() {
+    let mut lifecycle = published_lifecycle();
+    lifecycle.channel_opened().unwrap();
+    for _ in 0..4 {
+        lifecycle.write_started().unwrap();
+    }
+    assert!(lifecycle.write_started().is_err());
+
+    assert_eq!(lifecycle.begin_shutdown().unwrap(), LifecycleAction::Wait);
+    for _ in 0..3 {
+        assert_eq!(lifecycle.write_completed().unwrap(), LifecycleAction::Wait);
+    }
+    assert_eq!(
+        lifecycle.write_completed().unwrap(),
+        LifecycleAction::CloseChannel
+    );
+}
+
+#[test]
 fn test_begin_session_close_waits_for_channel_notification() {
     let mut lifecycle = published_lifecycle();
     lifecycle.channel_opened().unwrap();
@@ -82,6 +101,25 @@ fn test_remote_close_during_write_waits_for_write_completion() {
     lifecycle.write_started().unwrap();
 
     assert_eq!(lifecycle.channel_closed().unwrap(), LifecycleAction::Wait);
+    assert_eq!(
+        lifecycle.write_completed().unwrap(),
+        LifecycleAction::NotifyDisconnected
+    );
+    lifecycle.channel_opened().unwrap();
+}
+
+#[test]
+fn test_remote_close_waits_for_all_outstanding_writes() {
+    let mut lifecycle = published_lifecycle();
+    lifecycle.channel_opened().unwrap();
+    for _ in 0..4 {
+        lifecycle.write_started().unwrap();
+    }
+
+    assert_eq!(lifecycle.channel_closed().unwrap(), LifecycleAction::Wait);
+    for _ in 0..3 {
+        assert_eq!(lifecycle.write_completed().unwrap(), LifecycleAction::Wait);
+    }
     assert_eq!(
         lifecycle.write_completed().unwrap(),
         LifecycleAction::NotifyDisconnected

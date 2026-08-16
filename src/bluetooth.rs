@@ -9,6 +9,7 @@ pub const INPUT_QUEUE_CAPACITY: usize = 128;
 
 pub use dispatch::MainThreadCommandQueue;
 pub use main_queue::BluetoothMainThread;
+pub(crate) use types::RFCOMM_WRITE_WINDOW;
 pub use types::{BtCommand, BtError, BtEvent, BtInput, ConnectionId, DeviceAddress, WriteToken};
 
 #[cfg(test)]

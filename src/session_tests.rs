@@ -167,6 +167,17 @@ async fn test_run_session_sets_standard_terminal_environment() {
 }
 
 #[tokio::test]
+async fn test_run_session_starts_in_current_user_home() {
+    assert_session_output(
+        "test \"$PWD\" = \"$HOME\" && printf HOME_WORKDIR; sleep 0.1",
+        b"HOME_WORKDIR",
+        40,
+        120,
+    )
+    .await;
+}
+
+#[tokio::test]
 async fn test_run_session_flushes_output_after_child_exit() {
     let connection = connection(4);
     let sink = ObservableSink::default();
@@ -394,6 +405,53 @@ async fn test_run_session_limits_sustained_output() {
     })
     .await
     .expect("rate-limited PTY output timed out");
+    assert_eq!(result.unwrap(), SessionEnd::Disconnected);
+}
+
+#[tokio::test]
+async fn test_run_session_submits_four_writes_before_completion() {
+    let connection = connection(11);
+    let sink = ObservableSink::default();
+    let observer = sink.clone();
+    let (event_tx, mut event_rx) = mpsc::unbounded_channel();
+    let (_input_tx, mut input_rx) = mpsc::channel(1);
+    let mut limiter = test_limiter();
+    let config = SessionConfig::new(
+        "dd if=/dev/zero bs=4096 count=1 2>/dev/null; sleep 5",
+        40,
+        120,
+    )
+    .unwrap();
+
+    let session = run_session(
+        &mut event_rx,
+        &mut input_rx,
+        sink,
+        SessionRequest::new(config, connection, 64, CancellationToken::new()),
+        &mut limiter,
+    );
+    let drive = async move {
+        let mut outstanding = Vec::new();
+        while outstanding.len() < 4 {
+            for command in next_commands(&observer).await {
+                if let BtCommand::Send { token, data, .. } = command {
+                    assert!(!data.is_empty());
+                    assert!(data.len() <= 64);
+                    outstanding.push((token, data.len()));
+                }
+            }
+        }
+        for (token, len) in outstanding {
+            acknowledge(&event_tx, connection, token, len);
+        }
+        event_tx.send(BtEvent::Disconnected { connection }).unwrap();
+    };
+
+    let (result, ()) = tokio::time::timeout(Duration::from_secs(5), async {
+        tokio::join!(session, drive)
+    })
+    .await
+    .expect("four-write RFCOMM window timed out");
     assert_eq!(result.unwrap(), SessionEnd::Disconnected);
 }
 

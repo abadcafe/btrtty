@@ -5,6 +5,8 @@ use std::str::FromStr;
 use bytes::Bytes;
 use thiserror::Error;
 
+pub(crate) const RFCOMM_WRITE_WINDOW: usize = 4;
+
 #[derive(Clone, Debug, Eq, Hash, PartialEq)]
 pub struct DeviceAddress(String);
 

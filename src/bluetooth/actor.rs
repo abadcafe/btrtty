@@ -297,7 +297,7 @@ impl BluetoothActor {
         if !state.rejected.is_empty() {
             bail!("Bluetooth shutdown ended with rejected RFCOMM channels still closing");
         }
-        if state.queued_write.is_some()
+        if !state.queued_writes.is_empty()
             || !state.pending_writes.is_empty()
             || !state.retired_writes.is_empty()
         {

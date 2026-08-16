@@ -1,4 +1,4 @@
-use std::collections::HashMap;
+use std::collections::{HashMap, VecDeque};
 
 use bytes::Bytes;
 use objc2::rc::Retained;
@@ -64,7 +64,7 @@ pub(super) struct ActorState {
     pub(super) delivered: HashMap<usize, DeliveredChannel>,
     pub(super) active: Option<ActiveChannel>,
     pub(super) rejected: HashMap<usize, RejectedChannel>,
-    pub(super) queued_write: Option<PendingWrite>,
+    pub(super) queued_writes: VecDeque<PendingWrite>,
     pub(super) pending_writes: HashMap<WriteToken, PendingWrite>,
     pub(super) retired_writes: std::collections::HashSet<WriteToken>,
     pub(super) lifecycle: Lifecycle,
@@ -81,7 +81,7 @@ impl Default for ActorState {
             delivered: HashMap::new(),
             active: None,
             rejected: HashMap::new(),
-            queued_write: None,
+            queued_writes: VecDeque::new(),
             pending_writes: HashMap::new(),
             retired_writes: std::collections::HashSet::new(),
             lifecycle: Lifecycle::new(),

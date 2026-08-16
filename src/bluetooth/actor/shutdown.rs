@@ -12,7 +12,7 @@ impl BluetoothActor {
         let action = {
             let mut state = self.ivars().state.borrow_mut();
             state.acceptance.stop();
-            state.queued_write = None;
+            state.queued_writes.clear();
             if let Some(active) = state.active.as_mut() {
                 active.input = InputState::Closed;
             }
@@ -53,7 +53,7 @@ impl BluetoothActor {
     fn submit_channel_close(&self) {
         let channel = {
             let state = self.ivars().state.borrow();
-            if !state.pending_writes.is_empty() {
+            if !state.queued_writes.is_empty() || !state.pending_writes.is_empty() {
                 drop(state);
                 self.emit_fatal("close RFCOMM channel with write outstanding", -1);
                 return;
@@ -128,7 +128,7 @@ impl BluetoothActor {
         if !active.close_observed {
             return Err("release RFCOMM channel before close callback");
         }
-        if state.queued_write.is_some() || !state.pending_writes.is_empty() {
+        if !state.queued_writes.is_empty() || !state.pending_writes.is_empty() {
             return Err("release RFCOMM channel before write completion");
         }
         let connection = active.connection;

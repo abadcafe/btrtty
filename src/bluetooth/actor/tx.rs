@@ -6,7 +6,7 @@ use objc2_io_bluetooth::IOBluetoothRFCOMMChannel;
 
 use super::BluetoothActor;
 use super::state::PendingWrite;
-use crate::bluetooth::types::{BtEvent, ConnectionId, WriteToken};
+use crate::bluetooth::types::{BtEvent, ConnectionId, RFCOMM_WRITE_WINDOW, WriteToken};
 
 impl BluetoothActor {
     pub(super) fn send(&self, connection: ConnectionId, token: WriteToken, data: Bytes) {
@@ -18,9 +18,9 @@ impl BluetoothActor {
             if active.connection != connection {
                 return;
             }
-            if state.queued_write.is_some() || !state.pending_writes.is_empty() {
+            if state.queued_writes.len() + state.pending_writes.len() >= RFCOMM_WRITE_WINDOW {
                 drop(state);
-                self.emit_fatal("overlapping RFCOMM write command", -1);
+                self.emit_fatal("RFCOMM write command exceeded its bounded window", -1);
                 return;
             }
             active.channel.clone()
@@ -40,31 +40,41 @@ impl BluetoothActor {
         };
         // SAFETY: This is a non-blocking flow-state query on the main thread.
         if unsafe { channel.isTransmissionPaused() } {
-            self.ivars().state.borrow_mut().queued_write = Some(write);
+            self.ivars()
+                .state
+                .borrow_mut()
+                .queued_writes
+                .push_back(write);
             return;
         }
         self.submit_write(&channel, write);
     }
 
     pub(super) fn flow_available(&self, key: usize) {
-        let (channel, write) = {
-            let mut state = self.ivars().state.borrow_mut();
-            let Some(active) = state.active.as_ref() else {
-                return;
+        loop {
+            let (channel, write) = {
+                let mut state = self.ivars().state.borrow_mut();
+                let Some(active) = state.active.as_ref() else {
+                    return;
+                };
+                if Self::channel_key(&active.channel) != key {
+                    return;
+                }
+                let channel = active.channel.clone();
+                let Some(write) = state.queued_writes.pop_front() else {
+                    return;
+                };
+                (channel, write)
             };
-            if Self::channel_key(&active.channel) != key {
+            // SAFETY: This is a non-blocking flow-state query on the main thread.
+            if unsafe { channel.isTransmissionPaused() } {
+                self.ivars()
+                    .state
+                    .borrow_mut()
+                    .queued_writes
+                    .push_front(write);
                 return;
             }
-            let channel = active.channel.clone();
-            let Some(write) = state.queued_write.take() else {
-                return;
-            };
-            (channel, write)
-        };
-        // SAFETY: This is a non-blocking flow-state query on the main thread.
-        if unsafe { channel.isTransmissionPaused() } {
-            self.ivars().state.borrow_mut().queued_write = Some(write);
-        } else {
             self.submit_write(&channel, write);
         }
     }

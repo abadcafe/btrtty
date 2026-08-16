@@ -14,32 +14,49 @@ fn test_tx_window_splits_chunks_at_mtu() {
 
     let first = window.start_write().unwrap();
     assert_eq!(&first.data[..], b"abcd");
-    assert!(window.start_write().is_none());
-    window.complete(first.token, 4).unwrap();
-
     let second = window.start_write().unwrap();
     assert_eq!(&second.data[..], b"efgh");
-    window.complete(second.token, 4).unwrap();
-
     let third = window.start_write().unwrap();
     assert_eq!(&third.data[..], b"ij");
+    assert!(window.start_write().is_none());
+
+    window.complete(second.token, 4).unwrap();
+    window.complete(first.token, 4).unwrap();
     window.complete(third.token, 2).unwrap();
     assert!(window.is_ready_for_chunk());
     assert!(window.is_drained());
 }
 
 #[test]
-fn test_tx_window_keeps_one_outstanding_write() {
-    let mut window = TxWindow::new(8).unwrap();
-    window.enqueue(Bytes::from_static(b"hello")).unwrap();
-    let write = window.start_write().unwrap();
+fn test_tx_window_keeps_four_outstanding_writes() {
+    let mut window = TxWindow::new(4).unwrap();
+    window
+        .enqueue(Bytes::from_static(b"abcdefghijklmnopq"))
+        .unwrap();
+    let writes = (0..4)
+        .map(|_| window.start_write().unwrap())
+        .collect::<Vec<_>>();
 
+    assert_eq!(
+        writes.iter().map(|write| write.data.len()).sum::<usize>(),
+        16
+    );
     assert!(window.start_write().is_none());
     assert!(!window.is_drained());
     assert!(!window.is_ready_for_chunk());
     assert!(window.enqueue(Bytes::from_static(b"later")).is_err());
-    window.complete(write.token, write.data.len()).unwrap();
+
+    window
+        .complete(writes[2].token, writes[2].data.len())
+        .unwrap();
+    let final_write = window.start_write().unwrap();
+    assert_eq!(&final_write.data[..], b"q");
+    for write in [writes[3].token, writes[0].token, writes[1].token] {
+        window.complete(write, 4).unwrap();
+    }
+    window.complete(final_write.token, 1).unwrap();
     assert!(window.is_ready_for_chunk());
+    assert!(window.is_drained());
 }
 
 #[test]

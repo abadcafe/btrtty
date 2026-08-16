@@ -1,8 +1,9 @@
 use anyhow::{Result, bail};
 use bytes::Bytes;
+use std::collections::HashMap;
 use std::sync::atomic::{AtomicU64, Ordering};
 
-use crate::bluetooth::WriteToken;
+use crate::bluetooth::{RFCOMM_WRITE_WINDOW, WriteToken};
 
 static NEXT_WRITE_TOKEN: AtomicU64 = AtomicU64::new(1);
 
@@ -11,16 +12,11 @@ pub(crate) struct TxWrite {
     pub(crate) data: Bytes,
 }
 
-struct Outstanding {
-    token: WriteToken,
-    len: usize,
-}
-
 pub(crate) struct TxWindow {
     mtu: usize,
     chunk: Option<Bytes>,
     offset: usize,
-    outstanding: Option<Outstanding>,
+    outstanding: HashMap<WriteToken, usize>,
 }
 
 impl TxWindow {
@@ -32,16 +28,16 @@ impl TxWindow {
             mtu,
             chunk: None,
             offset: 0,
-            outstanding: None,
+            outstanding: HashMap::new(),
         })
     }
 
     pub(crate) fn is_ready_for_chunk(&self) -> bool {
-        self.chunk.is_none()
+        self.chunk.is_none() && self.outstanding.len() < RFCOMM_WRITE_WINDOW
     }
 
     pub(crate) fn is_drained(&self) -> bool {
-        self.chunk.is_none() && self.outstanding.is_none()
+        self.chunk.is_none() && self.outstanding.is_empty()
     }
 
     pub(crate) fn enqueue(&mut self, chunk: Bytes) -> Result<()> {
@@ -57,50 +53,34 @@ impl TxWindow {
     }
 
     pub(crate) fn start_write(&mut self) -> Option<TxWrite> {
-        if self.outstanding.is_some() {
+        if self.outstanding.len() >= RFCOMM_WRITE_WINDOW {
             return None;
         }
         let chunk = self.chunk.as_ref()?;
         let end = (self.offset + self.mtu).min(chunk.len());
         let data = chunk.slice(self.offset..end);
         let token = next_write_token();
-        self.outstanding = Some(Outstanding {
-            token,
-            len: data.len(),
-        });
+        self.outstanding.insert(token, data.len());
+        if end == chunk.len() {
+            self.chunk = None;
+            self.offset = 0;
+        } else {
+            self.offset = end;
+        }
         Some(TxWrite { token, data })
     }
 
     pub(crate) fn complete(&mut self, token: WriteToken, bytes_written: usize) -> Result<()> {
-        let outstanding = self
+        let expected = self
             .outstanding
-            .as_ref()
+            .get(&token)
             .ok_or_else(|| anyhow::anyhow!("unexpected RFCOMM write completion {token:?}"))?;
-        if outstanding.token != token {
+        if *expected != bytes_written {
             bail!(
-                "RFCOMM completion token mismatch: expected {:?}, received {token:?}",
-                outstanding.token
+                "RFCOMM completion length mismatch: expected {expected}, received {bytes_written}"
             );
         }
-        if outstanding.len != bytes_written {
-            bail!(
-                "RFCOMM completion length mismatch: expected {}, received {bytes_written}",
-                outstanding.len
-            );
-        }
-
-        self.offset += bytes_written;
-        self.outstanding = None;
-        if self.offset
-            == self
-                .chunk
-                .as_ref()
-                .expect("chunk exists while writing")
-                .len()
-        {
-            self.chunk = None;
-            self.offset = 0;
-        }
+        self.outstanding.remove(&token);
         Ok(())
     }
 }

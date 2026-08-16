@@ -1,4 +1,4 @@
-use anyhow::Result;
+use anyhow::{Context, Result};
 
 use super::SessionConfig;
 
@@ -11,6 +11,7 @@ pub(super) struct PtyProcess {
 }
 
 pub(super) fn spawn(config: &SessionConfig) -> Result<PtyProcess> {
+    let home = std::env::var_os("HOME").context("current user has no HOME directory")?;
     let (pty, pts) = pty_process::open()?;
     pty.resize(pty_process::Size::new(config.rows, config.cols))?;
     let (reader, writer) = pty.into_split();
@@ -18,6 +19,7 @@ pub(super) fn spawn(config: &SessionConfig) -> Result<PtyProcess> {
     let child = pty_process::Command::new("/bin/sh")
         .arg("-lc")
         .arg(&config.command)
+        .current_dir(home)
         .env("TERM", TERMINAL_TYPE)
         .env("COLORTERM", "truecolor")
         .kill_on_drop(true)

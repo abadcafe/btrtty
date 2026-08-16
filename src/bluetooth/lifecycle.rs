@@ -1,5 +1,7 @@
 use anyhow::{Result, bail};
 
+use crate::bluetooth::types::RFCOMM_WRITE_WINDOW;
+
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub(super) enum LifecycleAction {
     Wait,
@@ -29,7 +31,7 @@ enum ActiveMode {
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 struct ActiveState {
     mode: ActiveMode,
-    writing: bool,
+    writes: usize,
     channel_closed: bool,
 }
 
@@ -60,7 +62,7 @@ impl Lifecycle {
         }
         self.state = State::Active(ActiveState {
             mode: ActiveMode::Open,
-            writing: false,
+            writes: 0,
             channel_closed: false,
         });
         Ok(())
@@ -104,23 +106,22 @@ impl Lifecycle {
 
     pub(super) fn write_started(&mut self) -> Result<()> {
         match self.state {
-            State::Active(ActiveState {
-                mode: ActiveMode::Open,
-                writing: false,
-                channel_closed: false,
-            }) => {
-                self.state = State::Active(ActiveState {
+            State::Active(
+                mut active @ ActiveState {
                     mode: ActiveMode::Open,
-                    writing: true,
                     channel_closed: false,
-                });
+                    ..
+                },
+            ) if active.writes < RFCOMM_WRITE_WINDOW => {
+                active.writes += 1;
+                self.state = State::Active(active);
                 Ok(())
             }
             State::Active(ActiveState {
                 mode: ActiveMode::Open,
-                writing: true,
                 channel_closed: false,
-            }) => bail!("RFCOMM write already outstanding"),
+                ..
+            }) => bail!("RFCOMM write window is full"),
             State::Unpublished
             | State::Idle
             | State::Active(_)
@@ -132,8 +133,12 @@ impl Lifecycle {
 
     pub(super) fn write_completed(&mut self) -> Result<LifecycleAction> {
         match self.state {
-            State::Active(mut active) if active.writing => {
-                active.writing = false;
+            State::Active(mut active) if active.writes > 0 => {
+                active.writes -= 1;
+                if active.writes > 0 {
+                    self.state = State::Active(active);
+                    return Ok(LifecycleAction::Wait);
+                }
                 match (active.mode, active.channel_closed) {
                     (ActiveMode::Open, false) => {
                         self.state = State::Active(active);
@@ -167,7 +172,7 @@ impl Lifecycle {
             State::Active(mut active) if active.mode == ActiveMode::Open => {
                 active.mode = ActiveMode::ClosingSession;
                 self.state = State::Active(active);
-                Ok(if active.writing {
+                Ok(if active.writes > 0 {
                     LifecycleAction::Wait
                 } else {
                     LifecycleAction::CloseChannel
@@ -189,9 +194,9 @@ impl Lifecycle {
                 let was_closing = active.mode != ActiveMode::Open;
                 active.mode = ActiveMode::ClosingForShutdown;
                 self.state = State::Active(active);
-                if active.channel_closed && !active.writing {
+                if active.channel_closed && active.writes == 0 {
                     Ok(self.begin_service_withdrawal())
-                } else if active.writing || was_closing {
+                } else if active.writes > 0 || was_closing {
                     Ok(LifecycleAction::Wait)
                 } else {
                     Ok(LifecycleAction::CloseChannel)
@@ -209,7 +214,7 @@ impl Lifecycle {
         match self.state {
             State::Active(mut active) if !active.channel_closed => {
                 active.channel_closed = true;
-                if active.writing {
+                if active.writes > 0 {
                     if active.mode == ActiveMode::Open {
                         active.mode = ActiveMode::ClosingSession;
                     }

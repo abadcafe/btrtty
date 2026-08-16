@@ -245,7 +245,7 @@ impl BluetoothActor {
                     active.close_observed = true;
                     active.close_notification.take()
                 };
-                state.queued_write = None;
+                state.queued_writes.clear();
                 (notification, Some(state.lifecycle.channel_closed()))
             } else if let Some(rejected) = state.rejected.remove(&key) {
                 (
@@ -304,7 +304,7 @@ impl BluetoothActor {
                 return;
             }
             active.input = InputState::Closed;
-            state.queued_write = None;
+            state.queued_writes.clear();
             state.lifecycle.begin_session_close()
         };
         match action {
