@@ -1,6 +1,7 @@
 use std::time::{Duration, Instant};
 
-use super::metrics::{InputMetrics, LatencyStats, OutputMetrics};
+use super::metrics::{InputMetrics, LatencyStats, OutputMetrics, PerformanceReporter};
+use crate::bluetooth::ConnectionId;
 
 #[test]
 fn test_latency_stats_reports_bounded_percentiles_without_samples() {
@@ -25,9 +26,10 @@ fn test_latency_stats_reports_percentile_and_exact_maximum() {
 
 #[test]
 fn test_input_metrics_records_only_counts_bytes_and_latency() {
-    let mut metrics = InputMetrics::default();
-    metrics.record(3, Duration::from_micros(250), Duration::from_micros(500));
-    metrics.record(2, Duration::from_micros(750), Duration::from_micros(1_500));
+    let metrics = InputMetrics::default();
+    let task_metrics = metrics.clone();
+    task_metrics.record(3, Duration::from_micros(250), Duration::from_micros(500));
+    task_metrics.record(2, Duration::from_micros(750), Duration::from_micros(1_500));
 
     assert_eq!(metrics.bytes(), 5);
     assert_eq!(metrics.writes(), 2);
@@ -85,11 +87,49 @@ fn test_output_metrics_accumulates_bounded_blocking_intervals() {
     metrics.set_pacing_blocked(true, started + Duration::from_millis(5));
     metrics.set_pacing_blocked(false, started + Duration::from_millis(20));
     metrics.set_window_blocked(true, started + Duration::from_millis(20));
+
+    assert_eq!(
+        metrics.staging_blocked_at(started + Duration::from_millis(30)),
+        Duration::from_millis(10)
+    );
+    assert_eq!(
+        metrics.window_blocked_at(started + Duration::from_millis(30)),
+        Duration::from_millis(10)
+    );
     metrics.finish(started + Duration::from_millis(45));
 
     assert_eq!(metrics.staging_blocked(), Duration::from_millis(10));
     assert_eq!(metrics.pacing_blocked(), Duration::from_millis(15));
     assert_eq!(metrics.window_blocked(), Duration::from_millis(25));
+}
+
+#[test]
+fn test_performance_reporter_logs_periodic_snapshot_only_after_activity_changes() {
+    let started = Instant::now();
+    let input = InputMetrics::default();
+    let mut output = OutputMetrics::new(667);
+    let mut reporter =
+        PerformanceReporter::new(ConnectionId::new(1).unwrap(), 667, 20_480, 8, started);
+
+    assert!(!reporter.log_periodic(&input, &output, started));
+    output.record_packet(10, Duration::from_micros(100), started);
+    assert!(reporter.log_periodic(&input, &output, started + Duration::from_secs(5)));
+    assert!(!reporter.log_periodic(&input, &output, started + Duration::from_secs(10)));
+
+    output.record_completion(
+        Duration::from_micros(100),
+        Duration::ZERO,
+        Duration::from_micros(100),
+        started + Duration::from_secs(11),
+    );
+    assert!(reporter.log_periodic(&input, &output, started + Duration::from_secs(12)));
+
+    output.set_window_blocked(true, started + Duration::from_secs(13));
+    assert!(reporter.log_periodic(&input, &output, started + Duration::from_secs(14)));
+    assert!(reporter.log_periodic(&input, &output, started + Duration::from_secs(15)));
+
+    input.record(1, Duration::from_micros(100), Duration::from_micros(100));
+    assert!(reporter.log_periodic(&input, &output, started + Duration::from_secs(16)));
 }
 
 #[test]

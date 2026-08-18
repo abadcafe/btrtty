@@ -10,7 +10,6 @@ use crate::bluetooth::{BtInput, ConnectionId};
 
 pub(super) struct InputOutcome {
     pub(super) receiver: mpsc::Receiver<BtInput>,
-    pub(super) metrics: InputMetrics,
     pub(super) error: Option<anyhow::Error>,
 }
 
@@ -19,8 +18,8 @@ pub(super) async fn pump(
     connection: ConnectionId,
     mut writer: pty_process::OwnedWritePty,
     cancel: CancellationToken,
+    metrics: InputMetrics,
 ) -> InputOutcome {
-    let mut metrics = InputMetrics::default();
     let error = loop {
         let input = tokio::select! {
             biased;
@@ -50,9 +49,5 @@ pub(super) async fn pump(
         }
     };
 
-    InputOutcome {
-        receiver,
-        metrics,
-        error,
-    }
+    InputOutcome { receiver, error }
 }

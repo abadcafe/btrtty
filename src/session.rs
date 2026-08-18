@@ -4,7 +4,7 @@ mod pty;
 mod tx;
 
 use std::pin::Pin;
-use std::time::Instant as StdInstant;
+use std::time::{Duration, Instant as StdInstant};
 
 use anyhow::{Context, Result, anyhow, bail};
 use tokio::io::AsyncReadExt;
@@ -16,10 +16,11 @@ use crate::bluetooth::{
     BtCommand, BtError, BtEvent, BtInput, ConnectionId, MAX_RFCOMM_WRITE_COMMANDS,
 };
 use crate::egress::EgressLimiter;
-use metrics::OutputMetrics;
+use metrics::{InputMetrics, OutputMetrics, PerformanceReporter};
 use tx::{Transmitter, TxWrite};
 
 const MAX_PTY_READ_SIZE: usize = 16 * 1024;
+const METRICS_REPORT_INTERVAL: Duration = Duration::from_secs(5);
 
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct SessionConfig {
@@ -125,14 +126,24 @@ pub(crate) async fn run_session<S: BluetoothSink>(
     let write_window = egress.write_window(mtu, MAX_RFCOMM_WRITE_COMMANDS)?;
     let transmitter = Transmitter::new(mtu, staging_budget, write_window)?;
     let mut process = pty::spawn(&config).context("spawn PTY session")?;
+    let session_started = StdInstant::now();
+    let input_metrics = InputMetrics::default();
     let input_cancel = CancellationToken::new();
     let mut input_task = tokio::spawn(input::pump(
         input,
         connection,
         process.writer,
         input_cancel.clone(),
+        input_metrics.clone(),
     ));
     let mut output_metrics = OutputMetrics::new(mtu);
+    let mut reporter = PerformanceReporter::new(
+        connection,
+        mtu,
+        staging_budget,
+        write_window,
+        session_started,
+    );
     let mut early_input_join = None;
 
     let primary = {
@@ -145,6 +156,8 @@ pub(crate) async fn run_session<S: BluetoothSink>(
             shutdown: &shutdown,
             connection,
             metrics: &mut output_metrics,
+            input_metrics: &input_metrics,
+            reporter: &mut reporter,
         };
         let bridge = bridge_state.run(transmitter);
         tokio::pin!(bridge);
@@ -159,6 +172,7 @@ pub(crate) async fn run_session<S: BluetoothSink>(
         }
     };
 
+    reporter.log_pre_cleanup(&input_metrics, &output_metrics, StdInstant::now());
     input_cancel.cancel();
     let input_join = match early_input_join {
         Some(joined) => joined,
@@ -169,6 +183,7 @@ pub(crate) async fn run_session<S: BluetoothSink>(
         Ok(outcome) => outcome,
         Err(error) => {
             let cleanup = cleanup_child(&mut process.child).await;
+            reporter.log_final(&input_metrics, &output_metrics, StdInstant::now());
             return merge_join_failure(primary, &error, cleanup);
         }
     };
@@ -186,14 +201,7 @@ pub(crate) async fn run_session<S: BluetoothSink>(
 
     let input_result = input_outcome.error.take().map_or(Ok(()), Err);
     let cleanup_result = cleanup_child(&mut process.child).await;
-    metrics::log_session(
-        connection,
-        mtu,
-        staging_budget,
-        write_window,
-        &input_outcome.metrics,
-        &output_metrics,
-    );
+    reporter.log_final(&input_metrics, &output_metrics, StdInstant::now());
     while input_outcome.receiver.try_recv().is_ok() {}
 
     let end = merge_session_results(session_result, input_result, cleanup_result)?;
@@ -217,6 +225,8 @@ struct Bridge<'a, S> {
     shutdown: &'a CancellationToken,
     connection: ConnectionId,
     metrics: &'a mut OutputMetrics,
+    input_metrics: &'a InputMetrics,
+    reporter: &'a mut PerformanceReporter,
 }
 
 impl<S: BluetoothSink> Bridge<'_, S> {
@@ -227,6 +237,10 @@ impl<S: BluetoothSink> Bridge<'_, S> {
         let mut child_exited = false;
         let mut output_closed = false;
         let mut read_buffer = vec![0_u8; MAX_PTY_READ_SIZE.min(transmitter.remaining_capacity())];
+        let metrics_timer_start = Instant::now() + METRICS_REPORT_INTERVAL;
+        let mut metrics_timer =
+            tokio::time::interval_at(metrics_timer_start, METRICS_REPORT_INTERVAL);
+        metrics_timer.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
 
         loop {
             schedule_next(
@@ -257,44 +271,17 @@ impl<S: BluetoothSink> Bridge<'_, S> {
             tokio::select! {
                 biased;
                 () = self.shutdown.cancelled() => return Ok(SessionEnd::Shutdown),
+                _ = metrics_timer.tick() => {
+                    self.reporter.log_periodic(
+                        self.input_metrics,
+                        self.metrics,
+                        StdInstant::now(),
+                    );
+                }
                 event = self.events.recv() => {
-                    match event.context("Bluetooth event channel closed")? {
-                        BtEvent::WriteComplete {
-                            connection,
-                            token,
-                            bytes_written,
-                            status,
-                            native_queue_latency,
-                            flow_control_wait,
-                            completion_latency,
-                        } if connection == self.connection => {
-                            if status != 0 {
-                                bail!("RFCOMM async write {token:?} failed with IOReturn {status:#x}");
-                            }
-                            transmitter.complete(token, bytes_written)?;
-                            self.metrics.record_completion(
-                                native_queue_latency,
-                                flow_control_wait,
-                                completion_latency,
-                                StdInstant::now(),
-                            );
-                        }
-                        BtEvent::ConnectionError { connection, error }
-                            if connection == self.connection =>
-                        {
-                            return Ok(SessionEnd::ConnectionFailed(error));
-                        }
-                        BtEvent::Disconnected { connection } if connection == self.connection => {
-                            return Ok(SessionEnd::Disconnected);
-                        }
-                        BtEvent::Fatal(error) => return Err(error.into()),
-                        BtEvent::Connected { connection, .. } if connection == self.connection => {
-                            bail!("received duplicate Bluetooth connection event during a session");
-                        }
-                        BtEvent::Connected { .. }
-                        | BtEvent::WriteComplete { .. }
-                        | BtEvent::ConnectionError { .. }
-                        | BtEvent::Disconnected { .. } => {}
+                    let event = event.context("Bluetooth event channel closed")?;
+                    if let Some(end) = self.handle_event(&mut transmitter, event)? {
+                        return Ok(end);
                     }
                 }
                 status = self.child.wait(), if !child_exited => {
@@ -315,6 +302,50 @@ impl<S: BluetoothSink> Bridge<'_, S> {
                     timer_armed = false;
                 }
             }
+        }
+    }
+
+    fn handle_event(
+        &mut self,
+        transmitter: &mut Transmitter,
+        event: BtEvent,
+    ) -> Result<Option<SessionEnd>> {
+        match event {
+            BtEvent::WriteComplete {
+                connection,
+                token,
+                bytes_written,
+                status,
+                native_queue_latency,
+                flow_control_wait,
+                completion_latency,
+            } if connection == self.connection => {
+                if status != 0 {
+                    bail!("RFCOMM async write {token:?} failed with IOReturn {status:#x}");
+                }
+                transmitter.complete(token, bytes_written)?;
+                self.metrics.record_completion(
+                    native_queue_latency,
+                    flow_control_wait,
+                    completion_latency,
+                    StdInstant::now(),
+                );
+                Ok(None)
+            }
+            BtEvent::ConnectionError { connection, error } if connection == self.connection => {
+                Ok(Some(SessionEnd::ConnectionFailed(error)))
+            }
+            BtEvent::Disconnected { connection } if connection == self.connection => {
+                Ok(Some(SessionEnd::Disconnected))
+            }
+            BtEvent::Fatal(error) => Err(error.into()),
+            BtEvent::Connected { connection, .. } if connection == self.connection => {
+                bail!("received duplicate Bluetooth connection event during a session")
+            }
+            BtEvent::Connected { .. }
+            | BtEvent::WriteComplete { .. }
+            | BtEvent::ConnectionError { .. }
+            | BtEvent::Disconnected { .. } => Ok(None),
         }
     }
 }

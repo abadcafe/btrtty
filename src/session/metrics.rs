@@ -1,3 +1,4 @@
+use std::sync::{Arc, Mutex, MutexGuard};
 use std::time::{Duration, Instant};
 
 use tracing::info;
@@ -23,7 +24,7 @@ const LATENCY_BUCKETS_MICROS: [u64; 16] = [
     u64::MAX,
 ];
 
-#[derive(Default)]
+#[derive(Clone, Default)]
 pub(super) struct LatencyStats {
     buckets: [u64; LATENCY_BUCKETS_MICROS.len()],
     count: u64,
@@ -72,47 +73,62 @@ impl LatencyStats {
     }
 }
 
-#[derive(Default)]
-pub(super) struct InputMetrics {
+#[derive(Clone, Default)]
+struct InputSnapshot {
     bytes: u64,
     writes: u64,
     dispatch_latency: LatencyStats,
     write_latency: LatencyStats,
 }
 
+#[derive(Clone, Default)]
+pub(super) struct InputMetrics {
+    snapshot: Arc<Mutex<InputSnapshot>>,
+}
+
 impl InputMetrics {
-    pub(super) fn record(
-        &mut self,
-        bytes: usize,
-        dispatch_latency: Duration,
-        write_latency: Duration,
-    ) {
-        self.bytes = self
+    pub(super) fn record(&self, bytes: usize, dispatch_latency: Duration, write_latency: Duration) {
+        let mut snapshot = self.lock();
+        snapshot.bytes = snapshot
             .bytes
             .saturating_add(u64::try_from(bytes).unwrap_or(u64::MAX));
-        self.writes = self.writes.saturating_add(1);
-        self.dispatch_latency.record(dispatch_latency);
-        self.write_latency.record(write_latency);
+        snapshot.writes = snapshot.writes.saturating_add(1);
+        snapshot.dispatch_latency.record(dispatch_latency);
+        snapshot.write_latency.record(write_latency);
     }
 
     #[must_use]
-    pub(super) const fn bytes(&self) -> u64 {
-        self.bytes
+    #[cfg(test)]
+    pub(super) fn bytes(&self) -> u64 {
+        self.lock().bytes
     }
 
     #[must_use]
-    pub(super) const fn writes(&self) -> u64 {
-        self.writes
+    #[cfg(test)]
+    pub(super) fn writes(&self) -> u64 {
+        self.lock().writes
     }
 
     #[must_use]
-    pub(super) const fn dispatch_latency(&self) -> &LatencyStats {
-        &self.dispatch_latency
+    #[cfg(test)]
+    pub(super) fn dispatch_latency(&self) -> LatencyStats {
+        self.lock().dispatch_latency.clone()
     }
 
     #[must_use]
-    pub(super) const fn write_latency(&self) -> &LatencyStats {
-        &self.write_latency
+    #[cfg(test)]
+    pub(super) fn write_latency(&self) -> LatencyStats {
+        self.lock().write_latency.clone()
+    }
+
+    fn snapshot(&self) -> InputSnapshot {
+        self.lock().clone()
+    }
+
+    fn lock(&self) -> MutexGuard<'_, InputSnapshot> {
+        self.snapshot
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
     }
 }
 
@@ -140,8 +156,11 @@ impl BlockedInterval {
         self.set(false, now);
     }
 
-    fn total(&self) -> Duration {
-        self.accumulated
+    fn total_at(&self, now: Instant) -> Duration {
+        self.started.map_or(self.accumulated, |started| {
+            self.accumulated
+                .saturating_add(now.saturating_duration_since(started))
+        })
     }
 }
 
@@ -265,18 +284,31 @@ impl OutputMetrics {
     }
 
     #[must_use]
+    #[cfg(test)]
     pub(super) fn staging_blocked(&self) -> Duration {
-        self.staging_blocked.total()
+        self.staging_blocked.total_at(Instant::now())
     }
 
     #[must_use]
+    pub(super) fn staging_blocked_at(&self, now: Instant) -> Duration {
+        self.staging_blocked.total_at(now)
+    }
+
+    #[must_use]
+    #[cfg(test)]
     pub(super) fn pacing_blocked(&self) -> Duration {
-        self.pacing_blocked.total()
+        self.pacing_blocked.total_at(Instant::now())
     }
 
     #[must_use]
+    #[cfg(test)]
     pub(super) fn window_blocked(&self) -> Duration {
-        self.window_blocked.total()
+        self.window_blocked.total_at(Instant::now())
+    }
+
+    #[must_use]
+    pub(super) fn window_blocked_at(&self, now: Instant) -> Duration {
+        self.window_blocked.total_at(now)
     }
 
     pub(super) fn effective_kib_per_second(&self) -> u64 {
@@ -295,36 +327,131 @@ impl OutputMetrics {
     }
 }
 
-pub(super) fn log_session(
+#[derive(Clone, Copy, Default, Eq, PartialEq)]
+struct ActivityCounts {
+    input_bytes: u64,
+    input_writes: u64,
+    output_bytes: u64,
+    output_writes: u64,
+    output_completions: u64,
+}
+
+impl ActivityCounts {
+    fn new(input: &InputSnapshot, output: &OutputMetrics) -> Self {
+        Self {
+            input_bytes: input.bytes,
+            input_writes: input.writes,
+            output_bytes: output.bytes(),
+            output_writes: output.writes(),
+            output_completions: output.completion_latency.count,
+        }
+    }
+}
+
+pub(super) struct PerformanceReporter {
     connection: ConnectionId,
     mtu: usize,
     staging_budget: usize,
     write_window: usize,
-    input: &InputMetrics,
-    output: &OutputMetrics,
-) {
-    info!(
-        connection = connection.get(),
-        mtu,
-        staging_budget,
-        write_window,
-        input_bytes = input.bytes(),
-        input_writes = input.writes(),
-        input_dispatch_p99_us = duration_micros(input.dispatch_latency().percentile(99)),
-        input_write_p99_us = duration_micros(input.write_latency().percentile(99)),
-        output_bytes = output.bytes(),
-        output_writes = output.writes(),
-        full_mtu_percent = output.full_packet_percent(),
-        output_buffered_p99_us = duration_micros(output.buffered_latency().percentile(99)),
-        native_queue_p99_us = duration_micros(output.native_queue_latency().percentile(99)),
-        flow_wait_p99_us = duration_micros(output.flow_control_wait().percentile(99)),
-        completion_p99_us = duration_micros(output.completion_latency().percentile(99)),
-        staging_blocked_ms = duration_millis(output.staging_blocked()),
-        window_blocked_ms = duration_millis(output.window_blocked()),
-        pacing_blocked_ms = duration_millis(output.pacing_blocked()),
-        effective_output_kib_s = output.effective_kib_per_second(),
-        "Bluetooth session performance"
-    );
+    started_at: Instant,
+    last_periodic: ActivityCounts,
+}
+
+impl PerformanceReporter {
+    pub(super) fn new(
+        connection: ConnectionId,
+        mtu: usize,
+        staging_budget: usize,
+        write_window: usize,
+        started_at: Instant,
+    ) -> Self {
+        Self {
+            connection,
+            mtu,
+            staging_budget,
+            write_window,
+            started_at,
+            last_periodic: ActivityCounts::default(),
+        }
+    }
+
+    pub(super) fn log_periodic(
+        &mut self,
+        input: &InputMetrics,
+        output: &OutputMetrics,
+        now: Instant,
+    ) -> bool {
+        let input = input.snapshot();
+        let activity = ActivityCounts::new(&input, output);
+        if activity == self.last_periodic && !output.has_active_blocker() {
+            return false;
+        }
+        self.last_periodic = activity;
+        self.log("periodic", &input, output, now);
+        true
+    }
+
+    pub(super) fn log_pre_cleanup(
+        &mut self,
+        input: &InputMetrics,
+        output: &OutputMetrics,
+        now: Instant,
+    ) {
+        let input = input.snapshot();
+        self.last_periodic = ActivityCounts::new(&input, output);
+        self.log("pre_cleanup", &input, output, now);
+    }
+
+    pub(super) fn log_final(&self, input: &InputMetrics, output: &OutputMetrics, now: Instant) {
+        self.log("final", &input.snapshot(), output, now);
+    }
+
+    fn log(
+        &self,
+        phase: &'static str,
+        input: &InputSnapshot,
+        output: &OutputMetrics,
+        now: Instant,
+    ) {
+        let session_age = now.saturating_duration_since(self.started_at);
+        info!(
+            phase,
+            connection = self.connection.get(),
+            session_age_ms = duration_millis(session_age),
+            mtu = self.mtu,
+            staging_budget = self.staging_budget,
+            write_window = self.write_window,
+            input_bytes = input.bytes,
+            input_writes = input.writes,
+            input_dispatch_p99_us = duration_micros(input.dispatch_latency.percentile(99)),
+            input_write_p99_us = duration_micros(input.write_latency.percentile(99)),
+            output_bytes = output.bytes(),
+            output_writes = output.writes(),
+            full_mtu_percent = output.full_packet_percent(),
+            output_buffered_p99_us = duration_micros(output.buffered_latency().percentile(99)),
+            native_queue_p99_us = duration_micros(output.native_queue_latency().percentile(99)),
+            flow_wait_p99_us = duration_micros(output.flow_control_wait().percentile(99)),
+            completion_p99_us = duration_micros(output.completion_latency().percentile(99)),
+            staging_blocked_ms = duration_millis(output.staging_blocked_at(now)),
+            window_blocked_ms = duration_millis(output.window_blocked_at(now)),
+            pacing_blocked_ms = duration_millis(output.pacing_blocked_at(now)),
+            effective_output_kib_s = output.effective_kib_per_second(),
+            "Bluetooth session performance"
+        );
+    }
+}
+
+impl OutputMetrics {
+    fn has_active_blocker(&self) -> bool {
+        self.pacing_blocked.started.is_some()
+            || self.staging_blocked.started.is_some()
+            || self.window_blocked.started.is_some()
+    }
+
+    #[must_use]
+    fn pacing_blocked_at(&self, now: Instant) -> Duration {
+        self.pacing_blocked.total_at(now)
+    }
 }
 
 fn duration_micros(duration: Duration) -> u64 {

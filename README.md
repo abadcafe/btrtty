@@ -38,7 +38,7 @@ macOS main thread                 Tokio runtime（2 workers）
 - Mac→Linux 默认限制为 20 KiB/s；空闲不会积累 burst，最多首个 RFCOMM MTU chunk 立即发送，调度进度跨 Bluetooth 重连保留。
 - PTY output staging 按限速值容纳约 100 ms 输出且至少一个 MTU；staging 满或 outstanding window 满时停止读取 PTY，通过 PTY/kernel 自然反压，不丢字符。
 - Linux→Mac payload 使用独立 Tokio input task 和 `128` 条 bounded input queue，不与 PTY output pacing 共用 `select!` 调度。队列满会关闭当前连接，不会无限增长；断线/退出会取消正在等待 PTY 可写的 future，旧连接残留输入在重新开放 accept gate 前清空。
-- 每次会话结束只记录聚合性能指标：输入调度/PTY write、output staging、main-thread queue、flow-control、write completion 的延迟分布，以及 MTU 填充率、阻塞时间和有效速率；不记录 terminal payload。
+- active session 每 5 秒检查一次聚合性能指标，有新 input/output/completion 或仍处于反压状态时输出 `phase=periodic` 快照；会话离开主 bridge 后立即输出 `phase=pre_cleanup`，完成 input task 与 PTY child 清理后输出 `phase=final`。快照包含输入调度/PTY write、output staging、main-thread queue、flow-control、write completion 的延迟分布，以及 MTU 填充率、阻塞时间和有效速率；不记录 terminal payload。
 - SIGINT/SIGTERM handler 在 SDP publication 前完成安装。Tokio application task 即使 panic，watchdog 也会请求 native shutdown；PTY reader、child reap 和 native teardown 的错误均会返回，不会静默吞掉。
 
 ## 构建
