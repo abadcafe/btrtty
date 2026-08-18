@@ -1,5 +1,6 @@
 use std::cell::RefCell;
 use std::ffi::c_void;
+use std::time::Instant;
 
 use anyhow::{Result, anyhow, bail};
 use bytes::Bytes;
@@ -77,10 +78,7 @@ define_class!(
                 let data = unsafe {
                     std::slice::from_raw_parts(data_pointer.cast::<u8>(), data_length)
                 };
-                let input = BtInput {
-                    connection,
-                    data: Bytes::copy_from_slice(data),
-                };
+                let input = BtInput::new(connection, Bytes::copy_from_slice(data));
                 match self.ivars().input.try_send(input) {
                     Ok(()) => {}
                     Err(TrySendError::Full(_) | TrySendError::Closed(_)) => {
@@ -138,6 +136,7 @@ define_class!(
                     refcon: refcon as usize,
                     status,
                     bytes_written: None,
+                    observed_at: Instant::now(),
                 });
             }
         }
@@ -156,6 +155,7 @@ define_class!(
                     refcon: refcon as usize,
                     status,
                     bytes_written: Some(bytes_written),
+                    observed_at: Instant::now(),
                 });
             }
         }
@@ -253,7 +253,8 @@ impl BluetoothActor {
                 connection,
                 token,
                 data,
-            } => self.send(connection, token, data),
+                queued_at,
+            } => self.send(connection, token, data, queued_at),
             BtCommand::Close { connection } => self.begin_session_close(connection),
             BtCommand::Shutdown => self.begin_shutdown(),
         }
@@ -270,7 +271,8 @@ impl BluetoothActor {
                 refcon,
                 status,
                 bytes_written,
-            } => self.write_completed(channel_key, refcon, status, bytes_written),
+                observed_at,
+            } => self.write_completed(channel_key, refcon, status, bytes_written, observed_at),
             NativeAction::FlowAvailable { channel_key } => {
                 self.flow_available(channel_key);
             }

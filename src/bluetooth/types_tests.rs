@@ -1,4 +1,5 @@
 use bytes::Bytes;
+use std::time::Instant;
 
 use super::types::{BtCommand, ConnectionId, DeviceAddress, WriteToken};
 
@@ -37,6 +38,7 @@ fn test_bt_command_send_owns_payload() {
         connection,
         token,
         data: data.clone(),
+        queued_at: Instant::now(),
     };
     drop(data);
 

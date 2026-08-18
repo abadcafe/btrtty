@@ -1,4 +1,5 @@
 use bytes::Bytes;
+use std::time::Instant;
 
 use super::dispatch::{DispatchBuffer, DispatchItem, NativeAction};
 use super::types::{BtCommand, ConnectionId, WriteToken};
@@ -73,6 +74,7 @@ fn test_dispatch_item_owns_connection_scoped_send() {
         connection,
         token,
         data: Bytes::from_static(b"owned"),
+        queued_at: Instant::now(),
     });
 
     let DispatchItem::Command(BtCommand::Send {

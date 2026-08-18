@@ -8,7 +8,8 @@ const MIN_RATE_KIB_PER_SECOND: u16 = 1;
 const MAX_RATE_KIB_PER_SECOND: u16 = 200;
 const NANOS_PER_SECOND: u128 = 1_000_000_000;
 const MILLIS_PER_SECOND: u64 = 1_000;
-const QUEUE_TARGET_MILLIS: u64 = 100;
+const STAGING_TARGET_MILLIS: u64 = 100;
+const INFLIGHT_TARGET_MILLIS: u64 = 25;
 
 /// Validated maximum rate for bytes sent from the Mac to the Bluetooth client.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -36,12 +37,12 @@ impl OutputRate {
         self.kib_per_second
     }
 
-    fn bytes_per_second(self) -> u64 {
-        u64::from(self.kib_per_second) * KIB
+    const fn bytes_per_second(self) -> u64 {
+        self.kib_per_second as u64 * KIB
     }
 }
 
-/// Process-lifetime output pacer shared by successive Bluetooth sessions.
+/// Strict process-lifetime output pacer shared by successive sessions.
 pub struct EgressLimiter {
     bytes_per_second: u64,
     next_send_at: Instant,
@@ -56,34 +57,43 @@ impl EgressLimiter {
         }
     }
 
-    /// Size the bounded PTY output queue for approximately 100 ms of data.
-    pub(crate) fn queue_capacity(&self, chunk_size: usize) -> Result<usize> {
-        if chunk_size == 0 {
-            bail!("PTY output chunk size must be non-zero");
+    /// Bound unsent PTY output to approximately 100 ms of configured traffic.
+    pub(crate) fn staging_budget(&self, mtu: usize) -> Result<usize> {
+        if mtu == 0 {
+            bail!("RFCOMM MTU must be non-zero");
         }
-
-        let chunk_size = u64::try_from(chunk_size).context("PTY output chunk size exceeds u64")?;
-        let target_bytes_numerator = self
-            .bytes_per_second
-            .checked_mul(QUEUE_TARGET_MILLIS)
-            .context("PTY output queue size overflow")?;
-        let divisor = MILLIS_PER_SECOND
-            .checked_mul(chunk_size)
-            .context("PTY output queue divisor overflow")?;
-        let chunks = target_bytes_numerator.div_ceil(divisor).max(1);
-        usize::try_from(chunks).context("PTY output queue capacity exceeds usize")
+        Ok(self.byte_budget(STAGING_TARGET_MILLIS)?.max(mtu))
     }
 
-    pub(crate) fn reserve(&mut self, byte_count: usize) -> Result<Instant> {
-        self.reserve_at(byte_count, Instant::now())
+    /// Derive the write window from 25 ms of configured traffic and the MTU.
+    pub(crate) fn write_window(&self, mtu: usize, maximum: usize) -> Result<usize> {
+        if mtu == 0 {
+            bail!("RFCOMM MTU must be non-zero");
+        }
+        if maximum == 0 {
+            bail!("RFCOMM maximum write window must be non-zero");
+        }
+        let inflight_bytes = self.byte_budget(INFLIGHT_TARGET_MILLIS)?.max(mtu);
+        Ok(inflight_bytes.div_ceil(mtu).clamp(1, maximum))
     }
 
-    pub(crate) fn reserve_at(&mut self, byte_count: usize, now: Instant) -> Result<Instant> {
+    #[must_use]
+    pub(crate) fn ready_at(&self, now: Instant) -> Instant {
+        self.next_send_at.max(now)
+    }
+
+    /// Record a write at its actual submission time.
+    ///
+    /// This deliberately discards timer lateness and idle time, so neither can
+    /// turn into accumulated burst credit.
+    pub(crate) fn record_sent_at(&mut self, byte_count: usize, now: Instant) -> Result<()> {
         if byte_count == 0 {
-            bail!("cannot reserve zero output bytes");
+            bail!("cannot record an empty output write");
+        }
+        if now < self.next_send_at {
+            bail!("output write submitted before its strict pacing deadline");
         }
 
-        let deadline = self.next_send_at.max(now);
         let byte_count = u128::try_from(byte_count).context("output byte count exceeds u128")?;
         let duration_nanos = byte_count
             .checked_mul(NANOS_PER_SECOND)
@@ -91,9 +101,18 @@ impl EgressLimiter {
             .div_ceil(u128::from(self.bytes_per_second));
         let duration_nanos =
             u64::try_from(duration_nanos).context("output pacing duration exceeds u64")?;
-        self.next_send_at = deadline
+        self.next_send_at = now
             .checked_add(Duration::from_nanos(duration_nanos))
             .context("output rate deadline exceeds Tokio Instant")?;
-        Ok(deadline)
+        Ok(())
+    }
+
+    fn byte_budget(&self, milliseconds: u64) -> Result<usize> {
+        let numerator = self
+            .bytes_per_second
+            .checked_mul(milliseconds)
+            .context("output byte budget overflow")?;
+        usize::try_from(numerator.div_ceil(MILLIS_PER_SECOND))
+            .context("output byte budget exceeds usize")
     }
 }

@@ -55,7 +55,7 @@ pub fn start<S: BluetoothSink>(
     }
     let server = Server {
         events,
-        input,
+        input: Some(input),
         bluetooth,
         egress: EgressLimiter::new(config.output_rate),
         config,
@@ -66,7 +66,7 @@ pub fn start<S: BluetoothSink>(
 
 struct Server<S> {
     events: mpsc::UnboundedReceiver<BtEvent>,
-    input: mpsc::Receiver<BtInput>,
+    input: Option<mpsc::Receiver<BtInput>>,
     bluetooth: S,
     egress: EgressLimiter,
     config: AppConfig,
@@ -148,9 +148,13 @@ impl<S: BluetoothSink> Server<S> {
         connection: ConnectionId,
         mtu: usize,
     ) -> Result<Option<ServerState>> {
-        let end = run_session(
+        let input = self
+            .input
+            .take()
+            .context("Bluetooth input receiver is already owned by a session")?;
+        let outcome = run_session(
             &mut self.events,
-            &mut self.input,
+            input,
             self.bluetooth.clone(),
             SessionRequest::new(
                 self.config.session.clone(),
@@ -161,7 +165,8 @@ impl<S: BluetoothSink> Server<S> {
             &mut self.egress,
         )
         .await?;
-        match end {
+        self.input = Some(outcome.input);
+        match outcome.end {
             SessionEnd::Disconnected => {
                 info!(
                     connection = connection.get(),
@@ -224,7 +229,11 @@ impl<S: BluetoothSink> Server<S> {
     }
 
     fn accept_after(&mut self, connection: ConnectionId) -> Result<()> {
-        while self.input.try_recv().is_ok() {}
+        let input = self
+            .input
+            .as_mut()
+            .context("Bluetooth input receiver is missing after session cleanup")?;
+        while input.try_recv().is_ok() {}
         self.bluetooth
             .submit(BtCommand::AcceptNext { after: connection })?;
         info!("waiting for paired Bluetooth client");

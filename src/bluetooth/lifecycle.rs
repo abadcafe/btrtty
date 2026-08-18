@@ -1,6 +1,6 @@
 use anyhow::{Result, bail};
 
-use crate::bluetooth::types::RFCOMM_WRITE_WINDOW;
+use crate::bluetooth::types::MAX_RFCOMM_WRITE_COMMANDS;
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub(super) enum LifecycleAction {
@@ -112,7 +112,7 @@ impl Lifecycle {
                     channel_closed: false,
                     ..
                 },
-            ) if active.writes < RFCOMM_WRITE_WINDOW => {
+            ) if active.writes < MAX_RFCOMM_WRITE_COMMANDS => {
                 active.writes += 1;
                 self.state = State::Active(active);
                 Ok(())

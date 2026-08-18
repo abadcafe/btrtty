@@ -1,11 +1,12 @@
 use std::fmt;
 use std::num::NonZeroU64;
 use std::str::FromStr;
+use std::time::{Duration, Instant};
 
 use bytes::Bytes;
 use thiserror::Error;
 
-pub(crate) const RFCOMM_WRITE_WINDOW: usize = 8;
+pub(crate) const MAX_RFCOMM_WRITE_COMMANDS: usize = 32;
 
 #[derive(Clone, Debug, Eq, Hash, PartialEq)]
 pub struct DeviceAddress(String);
@@ -121,6 +122,9 @@ pub enum BtEvent {
         token: WriteToken,
         bytes_written: usize,
         status: i32,
+        native_queue_latency: Duration,
+        flow_control_wait: Duration,
+        completion_latency: Duration,
     },
     ConnectionError {
         connection: ConnectionId,
@@ -136,6 +140,18 @@ pub enum BtEvent {
 pub struct BtInput {
     pub connection: ConnectionId,
     pub data: Bytes,
+    pub received_at: Instant,
+}
+
+impl BtInput {
+    #[must_use]
+    pub fn new(connection: ConnectionId, data: Bytes) -> Self {
+        Self {
+            connection,
+            data,
+            received_at: Instant::now(),
+        }
+    }
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -147,6 +163,7 @@ pub enum BtCommand {
         connection: ConnectionId,
         token: WriteToken,
         data: Bytes,
+        queued_at: Instant,
     },
     Close {
         connection: ConnectionId,

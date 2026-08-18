@@ -4,8 +4,6 @@ use tokio::time::Instant;
 
 use crate::egress::{EgressLimiter, OutputRate};
 
-const PTY_CHUNK_SIZE: usize = 256;
-
 #[test]
 fn test_output_rate_accepts_supported_bounds() {
     assert_eq!(OutputRate::new(1).unwrap().kib_per_second(), 1);
@@ -19,75 +17,81 @@ fn test_output_rate_rejects_values_outside_supported_range() {
 }
 
 #[test]
-fn test_reserve_sends_first_allocation_immediately_then_paces_output() {
-    let mut limiter = EgressLimiter::new(OutputRate::new(2).unwrap());
-    let now = Instant::now();
-
-    assert_eq!(limiter.reserve_at(2 * 1024, now).unwrap(), now);
+fn test_staging_budget_tracks_one_hundred_milliseconds_of_rate() {
     assert_eq!(
-        limiter.reserve_at(2 * 1024, now).unwrap(),
-        now + Duration::from_secs(1)
+        EgressLimiter::new(OutputRate::new(1).unwrap())
+            .staging_budget(667)
+            .unwrap(),
+        667
+    );
+    assert_eq!(
+        EgressLimiter::new(OutputRate::new(20).unwrap())
+            .staging_budget(667)
+            .unwrap(),
+        2048
+    );
+    assert_eq!(
+        EgressLimiter::new(OutputRate::new(200).unwrap())
+            .staging_budget(667)
+            .unwrap(),
+        20_480
     );
 }
 
 #[test]
-fn test_reserve_serializes_future_allocations() {
-    let mut limiter = EgressLimiter::new(OutputRate::new(2).unwrap());
-    let now = Instant::now();
+fn test_write_window_tracks_twenty_five_milliseconds_of_rate() {
+    let limiter = EgressLimiter::new(OutputRate::new(200).unwrap());
+    assert_eq!(limiter.write_window(667, 32).unwrap(), 8);
+    assert_eq!(limiter.write_window(127, 32).unwrap(), 32);
 
-    assert_eq!(limiter.reserve_at(2 * 1024, now).unwrap(), now);
-    assert_eq!(
-        limiter.reserve_at(2 * 1024, now).unwrap(),
-        now + Duration::from_secs(1)
-    );
-    assert_eq!(
-        limiter.reserve_at(2 * 1024, now).unwrap(),
-        now + Duration::from_secs(2)
-    );
+    let slow = EgressLimiter::new(OutputRate::new(20).unwrap());
+    assert_eq!(slow.write_window(667, 32).unwrap(), 1);
 }
 
 #[test]
-fn test_reserve_does_not_accumulate_idle_burst() {
+fn test_write_window_rejects_invalid_limits() {
+    let limiter = EgressLimiter::new(OutputRate::new(200).unwrap());
+    assert!(limiter.write_window(0, 32).is_err());
+    assert!(limiter.write_window(667, 0).is_err());
+}
+
+#[test]
+fn test_record_sent_paces_from_actual_submission_time() {
     let mut limiter = EgressLimiter::new(OutputRate::new(2).unwrap());
     let now = Instant::now();
+    assert_eq!(limiter.ready_at(now), now);
+    limiter.record_sent_at(2 * 1024, now).unwrap();
+    assert_eq!(limiter.ready_at(now), now + Duration::from_secs(1));
 
-    assert_eq!(limiter.reserve_at(2 * 1024, now).unwrap(), now);
+    let late = now + Duration::from_millis(1100);
+    limiter.record_sent_at(2 * 1024, late).unwrap();
+    assert_eq!(limiter.ready_at(late), late + Duration::from_secs(1));
+}
+
+#[test]
+fn test_limiter_does_not_accumulate_idle_burst() {
+    let mut limiter = EgressLimiter::new(OutputRate::new(2).unwrap());
+    let now = Instant::now();
+    limiter.record_sent_at(2 * 1024, now).unwrap();
+
     let after_idle = now + Duration::from_secs(10);
+    assert_eq!(limiter.ready_at(after_idle), after_idle);
+    limiter.record_sent_at(2 * 1024, after_idle).unwrap();
     assert_eq!(
-        limiter.reserve_at(2 * 1024, after_idle).unwrap(),
-        after_idle
-    );
-    assert_eq!(
-        limiter.reserve_at(2 * 1024, after_idle).unwrap(),
+        limiter.ready_at(after_idle),
         after_idle + Duration::from_secs(1)
     );
 }
 
 #[test]
-fn test_queue_capacity_tracks_configured_rate() {
-    assert_eq!(
-        EgressLimiter::new(OutputRate::new(1).unwrap())
-            .queue_capacity(PTY_CHUNK_SIZE)
-            .unwrap(),
-        1
+fn test_limiter_rejects_early_or_empty_submission() {
+    let mut limiter = EgressLimiter::new(OutputRate::new(2).unwrap());
+    let now = Instant::now();
+    assert!(limiter.record_sent_at(0, now).is_err());
+    limiter.record_sent_at(1024, now).unwrap();
+    assert!(
+        limiter
+            .record_sent_at(1024, now + Duration::from_millis(1))
+            .is_err()
     );
-    assert_eq!(
-        EgressLimiter::new(OutputRate::new(20).unwrap())
-            .queue_capacity(PTY_CHUNK_SIZE)
-            .unwrap(),
-        8
-    );
-    assert_eq!(
-        EgressLimiter::new(OutputRate::new(200).unwrap())
-            .queue_capacity(PTY_CHUNK_SIZE)
-            .unwrap(),
-        80
-    );
-}
-
-#[test]
-fn test_reserve_rejects_empty_allocation() {
-    let mut limiter = EgressLimiter::new(OutputRate::new(20).unwrap());
-
-    assert!(limiter.reserve_at(0, Instant::now()).is_err());
 }

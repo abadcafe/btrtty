@@ -70,10 +70,10 @@ async fn test_unpaired_device_is_closed_by_connection_id_then_rearms() {
     })
     .await;
     input_tx
-        .try_send(BtInput {
+        .try_send(BtInput::new(
             connection,
-            data: Bytes::from_static(b"unpaired input"),
-        })
+            Bytes::from_static(b"unpaired input"),
+        ))
         .unwrap();
     event_tx.send(BtEvent::Disconnected { connection }).unwrap();
     wait_for(&sink, |command| {
@@ -84,10 +84,10 @@ async fn test_unpaired_device_is_closed_by_connection_id_then_rearms() {
     })
     .await;
     input_tx
-        .try_send(BtInput {
-            connection: ConnectionId::new(3).unwrap(),
-            data: Bytes::from_static(b"next client"),
-        })
+        .try_send(BtInput::new(
+            ConnectionId::new(3).unwrap(),
+            Bytes::from_static(b"next client"),
+        ))
         .expect("stale unpaired input was not drained before accepting again");
     shutdown.cancel();
     task.await.unwrap().unwrap();

@@ -1,5 +1,6 @@
 use std::collections::{HashSet, VecDeque};
 use std::sync::{Arc, Mutex};
+use std::time::Instant;
 
 use anyhow::{Result, bail};
 use objc2_core_foundation::{CFRunLoop, CFRunLoopSource};
@@ -19,6 +20,7 @@ pub(super) enum NativeAction {
         refcon: usize,
         status: i32,
         bytes_written: Option<usize>,
+        observed_at: Instant,
     },
     FlowAvailable {
         channel_key: usize,

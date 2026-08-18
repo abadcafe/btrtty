@@ -1,76 +1,110 @@
-use anyhow::{Result, bail};
-use bytes::Bytes;
-use std::collections::HashMap;
+use std::collections::{HashMap, VecDeque};
 use std::sync::atomic::{AtomicU64, Ordering};
+use std::time::Instant;
 
-use crate::bluetooth::{RFCOMM_WRITE_WINDOW, WriteToken};
+use anyhow::{Result, bail};
+use bytes::{Bytes, BytesMut};
+
+use crate::bluetooth::WriteToken;
 
 static NEXT_WRITE_TOKEN: AtomicU64 = AtomicU64::new(1);
 
-pub(crate) struct TxWrite {
-    pub(crate) token: WriteToken,
-    pub(crate) data: Bytes,
+pub(super) struct TxWrite {
+    pub(super) token: WriteToken,
+    pub(super) data: Bytes,
+    pub(super) buffered_since: Instant,
 }
 
-pub(crate) struct TxWindow {
+struct BufferedSpan {
+    remaining: usize,
+    received_at: Instant,
+}
+
+/// A bounded byte-stream staging area with MTU packetization and write ownership.
+pub(super) struct Transmitter {
     mtu: usize,
-    chunk: Option<Bytes>,
-    offset: usize,
+    staging_limit: usize,
+    write_window: usize,
+    staging: BytesMut,
+    spans: VecDeque<BufferedSpan>,
     outstanding: HashMap<WriteToken, usize>,
 }
 
-impl TxWindow {
-    pub(crate) fn new(mtu: usize) -> Result<Self> {
+impl Transmitter {
+    pub(super) fn new(mtu: usize, staging_limit: usize, write_window: usize) -> Result<Self> {
         if mtu == 0 || mtu > usize::from(u16::MAX) {
             bail!("invalid RFCOMM MTU {mtu}");
         }
+        if staging_limit < mtu {
+            bail!("PTY output staging limit must be at least one RFCOMM MTU");
+        }
+        if write_window == 0 {
+            bail!("RFCOMM write window must be non-zero");
+        }
         Ok(Self {
             mtu,
-            chunk: None,
-            offset: 0,
+            staging_limit,
+            write_window,
+            staging: BytesMut::with_capacity(staging_limit),
+            spans: VecDeque::new(),
             outstanding: HashMap::new(),
         })
     }
 
-    pub(crate) fn is_ready_for_chunk(&self) -> bool {
-        self.chunk.is_none() && self.outstanding.len() < RFCOMM_WRITE_WINDOW
-    }
-
-    pub(crate) fn is_drained(&self) -> bool {
-        self.chunk.is_none() && self.outstanding.is_empty()
-    }
-
-    pub(crate) fn enqueue(&mut self, chunk: Bytes) -> Result<()> {
-        if chunk.is_empty() {
-            bail!("cannot enqueue an empty PTY output chunk");
+    pub(super) fn append(&mut self, data: &[u8], received_at: Instant) -> Result<()> {
+        if data.is_empty() {
+            bail!("cannot stage empty PTY output");
         }
-        if self.chunk.is_some() {
-            bail!("RFCOMM transmit window already owns a PTY chunk");
+        if data.len() > self.remaining_capacity() {
+            bail!("PTY output exceeds its bounded staging budget");
         }
-        self.chunk = Some(chunk);
-        self.offset = 0;
+        self.staging.extend_from_slice(data);
+        self.spans.push_back(BufferedSpan {
+            remaining: data.len(),
+            received_at,
+        });
         Ok(())
     }
 
-    pub(crate) fn start_write(&mut self) -> Option<TxWrite> {
-        if self.outstanding.len() >= RFCOMM_WRITE_WINDOW {
-            return None;
-        }
-        let chunk = self.chunk.as_ref()?;
-        let end = (self.offset + self.mtu).min(chunk.len());
-        let data = chunk.slice(self.offset..end);
-        let token = next_write_token();
-        self.outstanding.insert(token, data.len());
-        if end == chunk.len() {
-            self.chunk = None;
-            self.offset = 0;
-        } else {
-            self.offset = end;
-        }
-        Some(TxWrite { token, data })
+    #[must_use]
+    pub(super) fn remaining_capacity(&self) -> usize {
+        self.staging_limit - self.staging.len()
     }
 
-    pub(crate) fn complete(&mut self, token: WriteToken, bytes_written: usize) -> Result<()> {
+    #[must_use]
+    pub(super) fn has_buffered_data(&self) -> bool {
+        !self.staging.is_empty()
+    }
+
+    #[must_use]
+    pub(super) fn window_full(&self) -> bool {
+        self.outstanding.len() >= self.write_window
+    }
+
+    #[must_use]
+    pub(super) fn is_drained(&self) -> bool {
+        self.staging.is_empty() && self.outstanding.is_empty()
+    }
+
+    pub(super) fn start_write(&mut self) -> Option<TxWrite> {
+        if self.window_full() || self.staging.is_empty() {
+            return None;
+        }
+
+        let length = self.mtu.min(self.staging.len());
+        let buffered_since = self.spans.front()?.received_at;
+        self.consume_spans(length);
+        let data = self.staging.split_to(length).freeze();
+        let token = next_write_token();
+        self.outstanding.insert(token, length);
+        Some(TxWrite {
+            token,
+            data,
+            buffered_since,
+        })
+    }
+
+    pub(super) fn complete(&mut self, token: WriteToken, bytes_written: usize) -> Result<()> {
         let expected = self
             .outstanding
             .get(&token)
@@ -82,6 +116,21 @@ impl TxWindow {
         }
         self.outstanding.remove(&token);
         Ok(())
+    }
+
+    fn consume_spans(&mut self, mut length: usize) {
+        while length > 0 {
+            let span = self
+                .spans
+                .front_mut()
+                .expect("staged bytes always have timestamp spans");
+            let consumed = length.min(span.remaining);
+            span.remaining -= consumed;
+            length -= consumed;
+            if span.remaining == 0 {
+                self.spans.pop_front();
+            }
+        }
     }
 }
 

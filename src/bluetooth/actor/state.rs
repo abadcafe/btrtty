@@ -1,4 +1,5 @@
 use std::collections::{HashMap, VecDeque};
+use std::time::Instant;
 
 use bytes::Bytes;
 use objc2::rc::Retained;
@@ -15,6 +16,10 @@ pub(super) struct PendingWrite {
     pub(super) connection: ConnectionId,
     pub(super) token: WriteToken,
     pub(super) data: Bytes,
+    pub(super) queued_at: Instant,
+    pub(super) actor_received_at: Instant,
+    pub(super) flow_started_at: Option<Instant>,
+    pub(super) submitted_at: Option<Instant>,
 }
 
 pub(super) struct ActiveChannel {
