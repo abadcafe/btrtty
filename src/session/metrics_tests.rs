@@ -1,7 +1,52 @@
+use std::sync::Arc;
+use std::sync::atomic::{AtomicUsize, Ordering};
 use std::time::{Duration, Instant};
+
+use tracing::span::{Attributes, Id, Record};
+use tracing::{Event, Level, Metadata, Subscriber};
 
 use super::metrics::{InputMetrics, LatencyStats, OutputMetrics, PerformanceReporter};
 use crate::bluetooth::ConnectionId;
+
+#[derive(Default)]
+struct EventLevels {
+    debug: AtomicUsize,
+    info: AtomicUsize,
+}
+
+struct LevelSubscriber {
+    levels: Arc<EventLevels>,
+}
+
+impl Subscriber for LevelSubscriber {
+    fn enabled(&self, _metadata: &Metadata<'_>) -> bool {
+        true
+    }
+
+    fn new_span(&self, _span: &Attributes<'_>) -> Id {
+        Id::from_u64(1)
+    }
+
+    fn record(&self, _span: &Id, _values: &Record<'_>) {}
+
+    fn record_follows_from(&self, _span: &Id, _follows: &Id) {}
+
+    fn event(&self, event: &Event<'_>) {
+        match *event.metadata().level() {
+            Level::DEBUG => {
+                self.levels.debug.fetch_add(1, Ordering::Relaxed);
+            }
+            Level::INFO => {
+                self.levels.info.fetch_add(1, Ordering::Relaxed);
+            }
+            _ => {}
+        }
+    }
+
+    fn enter(&self, _span: &Id) {}
+
+    fn exit(&self, _span: &Id) {}
+}
 
 #[test]
 fn test_latency_stats_reports_bounded_percentiles_without_samples() {
@@ -146,4 +191,29 @@ fn test_output_metrics_effective_rate_includes_final_completion() {
     );
 
     assert_eq!(metrics.effective_kib_per_second(), 100);
+}
+
+#[test]
+fn test_performance_reporter_emits_only_debug_events() {
+    let started = Instant::now();
+    let input = InputMetrics::default();
+    let mut output = OutputMetrics::new(512);
+    let mut reporter =
+        PerformanceReporter::new(ConnectionId::new(1).unwrap(), 512, 20_480, 8, started);
+    output.record_packet(10, Duration::ZERO, started);
+
+    let levels = Arc::new(EventLevels::default());
+    tracing::subscriber::with_default(
+        LevelSubscriber {
+            levels: Arc::clone(&levels),
+        },
+        || {
+            assert!(reporter.log_periodic(&input, &output, started + Duration::from_secs(5)));
+            reporter.log_pre_cleanup(&input, &output, started + Duration::from_secs(6));
+            reporter.log_final(&input, &output, started + Duration::from_secs(7));
+        },
+    );
+
+    assert_eq!(levels.debug.load(Ordering::Relaxed), 3);
+    assert_eq!(levels.info.load(Ordering::Relaxed), 0);
 }

@@ -1,7 +1,7 @@
 use std::sync::{Arc, Mutex, MutexGuard};
 use std::time::{Duration, Instant};
 
-use tracing::info;
+use tracing::debug;
 
 use crate::bluetooth::ConnectionId;
 
@@ -414,7 +414,7 @@ impl PerformanceReporter {
         now: Instant,
     ) {
         let session_age = now.saturating_duration_since(self.started_at);
-        info!(
+        debug!(
             phase,
             connection = self.connection.get(),
             session_age_ms = duration_millis(session_age),
