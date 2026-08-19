@@ -12,23 +12,22 @@ cargo clippy --all-targets --all-features -- -D warnings
 ./scripts/package.sh
 ```
 
-- 78 项模块/单元测试与 2 项二进制元数据测试通过。
+- 84 项模块/单元测试与 2 项二进制元数据测试通过。
 - 单文件 Mach-O 内嵌稳定 `CFBundleIdentifier` 和 `NSBluetoothAlwaysUsageDescription`，无 App Bundle。
 - RFCOMM 与 PTY 之间没有握手、控制帧或 payload 转换。
 - PTY 往返保持 UTF-8、NUL、ESC/方向键序列原始字节。
 - `0x03` 由 PTY line discipline 作为 Ctrl-C 交给 foreground process group。
 - `--rows/--cols` 指定的尺寸已经通过 `stty size` 集成测试验证。
 - PTY 设置 `TERM=xterm-256color`、`COLORTERM=truecolor`，不安装自定义终端描述。
-- PTY output 没有固定延时合并器或中间 chunk channel；限速器空闲时首批字节立即可提交，等待 pacing deadline 时自然合并，实际提交时才按 MTU 分块。
-- outstanding RFCOMM write window 按约 25 ms 的配置流量与实际 MTU 派生，范围为 `1..=32`；buffer 所有权保持到对应 completion，支持 completion 乱序到达。
+- PTY output 没有固定延时合并器或中间 chunk channel；限速器空闲时首批字节立即可提交，持续输出只等待真实 pacing timer，timer 触发后按当时可用 credit 提交不超过 MTU 的前缀，不等待凑满 MTU。
+- outstanding RFCOMM command window 按约 25 ms 的配置流量与 1 ms pacing packet 派生，范围为 `1..=32`；buffer 所有权保持到对应 completion，支持 completion 乱序到达。
 - 所有 data、write completion、close 和 command 均由不可复用的 `ConnectionId` 隔离；旧连接事件不能命中新连接。首次 acceptance 在 listener publication 前 armed，reconnect permit 只能消费一次。
 - `--max-output-rate` 默认 20 KiB/s，只接受 `1..=200`。
-- 空闲不会积累 burst；最多首个实际 MTU 的数据立即发送，后续输出从每次真实提交时刻起按配置速率调度，进度不会因 Bluetooth 重连重置。
+- 空闲 credit 最多积累一个实际 MTU；首批数据立即发送，后续输出从每次成功 command-queue submission 起按配置速率调度，进度不会因 Bluetooth 重连重置。
 - bounded PTY output staging 为 `max(MTU, ceil(rate × 1024 × 100 ms))` 字节；满载时停止读取 PTY，以 kernel backpressure 限制内存，不丢弃输出。
 - 取消会 kill/reap PTY child。
 - Linux→Mac 使用独立 Tokio input task 和 128 条 bounded input queue，不受 output pacing/select 调度影响；队列满会关闭当前连接，阻塞中的 PTY input write 可被 shutdown/disconnect 取消，unpaired/旧连接残留输入会在下一次 accept 前清空。
 - PTY child 退出后会先排空已读取的 output 和 RFCOMM write completion；PTY reader、input task join 和 child cleanup 错误不会被吞掉。
-- active session 每 5 秒在指标变化或持续反压时以 debug 级别输出 `phase=periodic` 累计快照；退出 bridge 后先输出 `phase=pre_cleanup`，完成 input/child 清理后输出 `phase=final`。默认 info 日志不显示这些快照；debug 日志只含聚合计数、MTU 填充率、有效速率、阻塞时间与各阶段延迟分布，不含 terminal payload。
 - 未配对的 Bluetooth 连接在创建 PTY 前收到 `Close`；已配对连接不额外要求链路加密。
 - 单实例锁会拒绝第二个 live btrtty，并在 owner 退出后允许重新获取。
 - Bluetooth 生命周期状态机已覆盖：等待 outstanding write、等待 active/rejected channel 的实际 close callback、session close 升级为 shutdown、channel 全部关闭后才允许移除 SDP，以及 SDP 移除后才允许停止 CFRunLoop。
@@ -108,9 +107,8 @@ picocom -b 115200 --flow n /dev/rfcomm0
 - [ ] `yes` 大量输出时 RSS 稳定在有界范围，停止后能恢复交互。
 - [ ] 空闲后的首批字节无需等待固定合并定时器，最多一个实际 MTU 可立即到达，且不出现累计 burst。
 - [ ] 连续输出及立即重连后的输出按配置的 KiB/s 调度，reconnect 不重置尚未到期的发送进度。
-- [ ] Vim/nvim/codex 连续刷新时，周期快照中的完整 MTU 比例、有效速率及各阶段 p99 延迟可解释实际观察到的刷新表现。
-- [ ] 使用 `RUST_LOG=btrtty=debug` 启动且不断开 active session，持续操作至少 5 秒后即可看到 `phase=periodic`；停止产生新数据且不存在反压时不重复刷相同快照。默认 info 日志中不出现这些性能快照。
-- [ ] 长时间空闲后输入第一个字符，Bluetooth callback 到 PTY write-start 的 p99 不受 Mac→Linux pacing 阻塞；若仍有无线链路唤醒延迟，单独记录 controller mode-change 日志。
+- [ ] Vim/nvim/codex 连续刷新时保持可交互，不出现持续的光标重影、刷新积压或明显卡顿。
+- [ ] 长时间空闲后输入第一个字符，不会由应用层固定延时引入额外停顿；若仍有无线链路唤醒延迟，单独记录 controller mode-change 日志。
 - [ ] 未配对设备不能得到 shell。
 - [ ] 从 Mac 配对列表移除设备后，该设备 reconnect 被拒绝。
 - [ ] 保存 btrtty stderr 与 macOS Bluetooth 日志，确认最终关闭严格按照 channel-close callback → remove SDP → listener unregister 顺序发生。

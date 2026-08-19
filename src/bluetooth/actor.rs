@@ -1,6 +1,5 @@
 use std::cell::RefCell;
 use std::ffi::c_void;
-use std::time::Instant;
 
 use anyhow::{Result, anyhow, bail};
 use bytes::Bytes;
@@ -136,7 +135,6 @@ define_class!(
                     refcon: refcon as usize,
                     status,
                     bytes_written: None,
-                    observed_at: Instant::now(),
                 });
             }
         }
@@ -155,7 +153,6 @@ define_class!(
                     refcon: refcon as usize,
                     status,
                     bytes_written: Some(bytes_written),
-                    observed_at: Instant::now(),
                 });
             }
         }
@@ -253,8 +250,7 @@ impl BluetoothActor {
                 connection,
                 token,
                 data,
-                queued_at,
-            } => self.send(connection, token, data, queued_at),
+            } => self.send(connection, token, data),
             BtCommand::Close { connection } => self.begin_session_close(connection),
             BtCommand::Shutdown => self.begin_shutdown(),
         }
@@ -271,8 +267,7 @@ impl BluetoothActor {
                 refcon,
                 status,
                 bytes_written,
-                observed_at,
-            } => self.write_completed(channel_key, refcon, status, bytes_written, observed_at),
+            } => self.write_completed(channel_key, refcon, status, bytes_written),
             NativeAction::FlowAvailable { channel_key } => {
                 self.flow_available(channel_key);
             }

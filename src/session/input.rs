@@ -1,11 +1,8 @@
-use std::time::Instant;
-
 use anyhow::{Context, Result};
 use tokio::io::AsyncWriteExt;
 use tokio::sync::mpsc;
 use tokio_util::sync::CancellationToken;
 
-use super::metrics::InputMetrics;
 use crate::bluetooth::{BtInput, ConnectionId};
 
 pub(super) struct InputOutcome {
@@ -18,7 +15,6 @@ pub(super) async fn pump(
     connection: ConnectionId,
     mut writer: pty_process::OwnedWritePty,
     cancel: CancellationToken,
-    metrics: InputMetrics,
 ) -> InputOutcome {
     let error = loop {
         let input = tokio::select! {
@@ -33,9 +29,6 @@ pub(super) async fn pump(
             continue;
         }
 
-        let write_started = Instant::now();
-        let dispatch_latency = write_started.saturating_duration_since(input.received_at);
-        let bytes = input.data.len();
         let result: Result<()> = tokio::select! {
             biased;
             () = cancel.cancelled() => break None,
@@ -43,9 +36,8 @@ pub(super) async fn pump(
                 result.context("write raw RFCOMM data to PTY")
             }
         };
-        match result {
-            Ok(()) => metrics.record(bytes, dispatch_latency, write_started.elapsed()),
-            Err(error) => break Some(error),
+        if let Err(error) = result {
+            break Some(error);
         }
     };
 

@@ -1,6 +1,5 @@
 use std::collections::{HashSet, VecDeque};
 use std::sync::{Arc, Mutex};
-use std::time::Instant;
 
 use anyhow::{Result, bail};
 use objc2_core_foundation::{CFRunLoop, CFRunLoopSource};
@@ -20,7 +19,6 @@ pub(super) enum NativeAction {
         refcon: usize,
         status: i32,
         bytes_written: Option<usize>,
-        observed_at: Instant,
     },
     FlowAvailable {
         channel_key: usize,
@@ -208,12 +206,12 @@ fn submit(state: &Mutex<DispatchState>, item: DispatchItem) -> Result<()> {
     let mut state = state
         .lock()
         .map_err(|_| anyhow::anyhow!("Bluetooth dispatch queue mutex poisoned"))?;
+    if state.source_address == 0 || state.run_loop_address == 0 {
+        bail!("Bluetooth dispatch queue is not installed");
+    }
     match item {
         DispatchItem::Command(command) => state.buffer.push_command(command)?,
         DispatchItem::Native(action) => state.buffer.push_native(action)?,
-    }
-    if state.source_address == 0 || state.run_loop_address == 0 {
-        bail!("Bluetooth dispatch queue is not installed");
     }
 
     // SAFETY: Dispatcher installs retained CF objects before callbacks or

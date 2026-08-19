@@ -363,10 +363,8 @@ async fn test_run_session_limits_sustained_output() {
     let (event_tx, mut event_rx) = mpsc::unbounded_channel();
     let (_input_tx, input_rx) = mpsc::channel(1);
     let mut limiter = EgressLimiter::new(OutputRate::new(1).unwrap());
-    let now = Instant::now();
-    limiter.record_sent_at(1024, now).unwrap();
     let config = SessionConfig::new(
-        "dd if=/dev/zero bs=256 count=1 2>/dev/null; sleep 5",
+        "dd if=/dev/zero bs=1024 count=1 2>/dev/null; sleep 5",
         40,
         120,
     )
@@ -382,7 +380,7 @@ async fn test_run_session_limits_sustained_output() {
     );
     let drive = async move {
         let mut received = 0;
-        while received < 256 {
+        while received < 1024 {
             for command in next_commands(&observer).await {
                 if let BtCommand::Send { token, data, .. } = command {
                     received += data.len();
@@ -390,7 +388,7 @@ async fn test_run_session_limits_sustained_output() {
                 }
             }
         }
-        assert!(started.elapsed() >= Duration::from_millis(900));
+        assert!(started.elapsed() >= Duration::from_millis(650));
         event_tx.send(BtEvent::Disconnected { connection }).unwrap();
     };
 
@@ -522,9 +520,6 @@ fn acknowledge(
             token,
             bytes_written,
             status: 0,
-            native_queue_latency: Duration::ZERO,
-            flow_control_wait: Duration::ZERO,
-            completion_latency: Duration::ZERO,
         })
         .unwrap();
 }

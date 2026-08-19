@@ -1,5 +1,4 @@
 use std::ffi::c_void;
-use std::time::Instant;
 
 use bytes::Bytes;
 use objc2::DefinedClass;
@@ -10,14 +9,7 @@ use super::state::PendingWrite;
 use crate::bluetooth::types::{BtEvent, ConnectionId, MAX_RFCOMM_WRITE_COMMANDS, WriteToken};
 
 impl BluetoothActor {
-    pub(super) fn send(
-        &self,
-        connection: ConnectionId,
-        token: WriteToken,
-        data: Bytes,
-        queued_at: Instant,
-    ) {
-        let actor_received_at = Instant::now();
+    pub(super) fn send(&self, connection: ConnectionId, token: WriteToken, data: Bytes) {
         let channel = {
             let state = self.ivars().state.borrow();
             let Some(active) = state.active.as_ref() else {
@@ -41,18 +33,13 @@ impl BluetoothActor {
             self.begin_session_close(connection);
             return;
         }
-        let mut write = PendingWrite {
+        let write = PendingWrite {
             connection,
             token,
             data,
-            queued_at,
-            actor_received_at,
-            flow_started_at: None,
-            submitted_at: None,
         };
         // SAFETY: This is a non-blocking flow-state query on the main thread.
         if unsafe { channel.isTransmissionPaused() } {
-            write.flow_started_at = Some(Instant::now());
             self.ivars()
                 .state
                 .borrow_mut()
@@ -92,7 +79,7 @@ impl BluetoothActor {
         }
     }
 
-    fn submit_write(&self, channel: &IOBluetoothRFCOMMChannel, mut write: PendingWrite) {
+    fn submit_write(&self, channel: &IOBluetoothRFCOMMChannel, write: PendingWrite) {
         let Ok(refcon) = usize::try_from(write.token.get()) else {
             self.emit_fatal("encode RFCOMM write token", -1);
             return;
@@ -101,7 +88,6 @@ impl BluetoothActor {
         let token = write.token;
         let pointer = write.data.as_ptr().cast_mut().cast::<c_void>();
         let length = u16::try_from(write.data.len()).expect("write length was validated");
-        write.submitted_at = Some(Instant::now());
         {
             let mut state = self.ivars().state.borrow_mut();
             if state.lifecycle.write_started().is_err() {
@@ -139,7 +125,6 @@ impl BluetoothActor {
         refcon: usize,
         status: i32,
         actual: Option<usize>,
-        observed_at: Instant,
     ) {
         let Some(token_value) = u64::try_from(refcon).ok() else {
             self.emit_fatal("decode RFCOMM write token", -1);
@@ -176,23 +161,11 @@ impl BluetoothActor {
             actual.unwrap_or_else(|| if status == 0 { pending.data.len() } else { 0 });
         let successful = status == 0 && bytes_written == pending.data.len();
         if successful {
-            let submitted_at = pending
-                .submitted_at
-                .expect("pending RFCOMM write has a submission timestamp");
             let _ = self.ivars().events.send(BtEvent::WriteComplete {
                 connection: pending.connection,
                 token: pending.token,
                 bytes_written,
                 status,
-                native_queue_latency: pending
-                    .actor_received_at
-                    .saturating_duration_since(pending.queued_at),
-                flow_control_wait: pending
-                    .flow_started_at
-                    .map_or(std::time::Duration::ZERO, |started| {
-                        submitted_at.saturating_duration_since(started)
-                    }),
-                completion_latency: observed_at.saturating_duration_since(submitted_at),
             });
         } else {
             let error_status = if status == 0 { -1 } else { status };

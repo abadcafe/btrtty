@@ -1,7 +1,6 @@
 use bytes::Bytes;
-use std::time::Instant;
 
-use super::dispatch::{DispatchBuffer, DispatchItem, NativeAction};
+use super::dispatch::{DispatchBuffer, DispatchItem, Dispatcher, NativeAction};
 use super::types::{BtCommand, ConnectionId, WriteToken};
 
 #[test]
@@ -74,7 +73,6 @@ fn test_dispatch_item_owns_connection_scoped_send() {
         connection,
         token,
         data: Bytes::from_static(b"owned"),
-        queued_at: Instant::now(),
     });
 
     let DispatchItem::Command(BtCommand::Send {
@@ -103,4 +101,19 @@ fn test_dispatch_buffer_coalesces_repeatable_native_hints_until_drain() {
 
     buffer.push_native(flow).unwrap();
     assert_eq!(buffer.drain(), vec![DispatchItem::Native(flow)]);
+}
+
+#[test]
+fn test_failed_uninstalled_submission_does_not_enqueue_command() {
+    let dispatcher = Dispatcher::new();
+    let command_queue = dispatcher.command_queue();
+
+    assert!(
+        command_queue
+            .submit(BtCommand::AcceptNext {
+                after: ConnectionId::new(12).unwrap(),
+            })
+            .is_err()
+    );
+    assert!(dispatcher.drain().unwrap().is_empty());
 }

@@ -1,10 +1,8 @@
 mod input;
-mod metrics;
 mod pty;
 mod tx;
 
 use std::pin::Pin;
-use std::time::{Duration, Instant as StdInstant};
 
 use anyhow::{Context, Result, anyhow, bail};
 use tokio::io::AsyncReadExt;
@@ -15,12 +13,10 @@ use tokio_util::sync::CancellationToken;
 use crate::bluetooth::{
     BtCommand, BtError, BtEvent, BtInput, ConnectionId, MAX_RFCOMM_WRITE_COMMANDS,
 };
-use crate::egress::EgressLimiter;
-use metrics::{InputMetrics, OutputMetrics, PerformanceReporter};
+use crate::egress::{EgressDecision, EgressLimiter};
 use tx::{Transmitter, TxWrite};
 
 const MAX_PTY_READ_SIZE: usize = 16 * 1024;
-const METRICS_REPORT_INTERVAL: Duration = Duration::from_secs(5);
 
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct SessionConfig {
@@ -124,26 +120,16 @@ pub(crate) async fn run_session<S: BluetoothSink>(
     } = request;
     let staging_budget = egress.staging_budget(mtu)?;
     let write_window = egress.write_window(mtu, MAX_RFCOMM_WRITE_COMMANDS)?;
+    egress.configure_mtu(mtu, Instant::now())?;
     let transmitter = Transmitter::new(mtu, staging_budget, write_window)?;
     let mut process = pty::spawn(&config).context("spawn PTY session")?;
-    let session_started = StdInstant::now();
-    let input_metrics = InputMetrics::default();
     let input_cancel = CancellationToken::new();
     let mut input_task = tokio::spawn(input::pump(
         input,
         connection,
         process.writer,
         input_cancel.clone(),
-        input_metrics.clone(),
     ));
-    let mut output_metrics = OutputMetrics::new(mtu);
-    let mut reporter = PerformanceReporter::new(
-        connection,
-        mtu,
-        staging_budget,
-        write_window,
-        session_started,
-    );
     let mut early_input_join = None;
 
     let primary = {
@@ -155,9 +141,6 @@ pub(crate) async fn run_session<S: BluetoothSink>(
             egress,
             shutdown: &shutdown,
             connection,
-            metrics: &mut output_metrics,
-            input_metrics: &input_metrics,
-            reporter: &mut reporter,
         };
         let bridge = bridge_state.run(transmitter);
         tokio::pin!(bridge);
@@ -172,18 +155,15 @@ pub(crate) async fn run_session<S: BluetoothSink>(
         }
     };
 
-    reporter.log_pre_cleanup(&input_metrics, &output_metrics, StdInstant::now());
     input_cancel.cancel();
     let input_join = match early_input_join {
         Some(joined) => joined,
         None => input_task.await,
     };
-    output_metrics.finish(StdInstant::now());
     let mut input_outcome = match input_join {
         Ok(outcome) => outcome,
         Err(error) => {
             let cleanup = cleanup_child(&mut process.child).await;
-            reporter.log_final(&input_metrics, &output_metrics, StdInstant::now());
             return merge_join_failure(primary, &error, cleanup);
         }
     };
@@ -201,7 +181,6 @@ pub(crate) async fn run_session<S: BluetoothSink>(
 
     let input_result = input_outcome.error.take().map_or(Ok(()), Err);
     let cleanup_result = cleanup_child(&mut process.child).await;
-    reporter.log_final(&input_metrics, &output_metrics, StdInstant::now());
     while input_outcome.receiver.try_recv().is_ok() {}
 
     let end = merge_session_results(session_result, input_result, cleanup_result)?;
@@ -224,9 +203,6 @@ struct Bridge<'a, S> {
     egress: &'a mut EgressLimiter,
     shutdown: &'a CancellationToken,
     connection: ConnectionId,
-    metrics: &'a mut OutputMetrics,
-    input_metrics: &'a InputMetrics,
-    reporter: &'a mut PerformanceReporter,
 }
 
 impl<S: BluetoothSink> Bridge<'_, S> {
@@ -237,10 +213,6 @@ impl<S: BluetoothSink> Bridge<'_, S> {
         let mut child_exited = false;
         let mut output_closed = false;
         let mut read_buffer = vec![0_u8; MAX_PTY_READ_SIZE.min(transmitter.remaining_capacity())];
-        let metrics_timer_start = Instant::now() + METRICS_REPORT_INTERVAL;
-        let mut metrics_timer =
-            tokio::time::interval_at(metrics_timer_start, METRICS_REPORT_INTERVAL);
-        metrics_timer.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
 
         loop {
             schedule_next(
@@ -250,18 +222,7 @@ impl<S: BluetoothSink> Bridge<'_, S> {
                 send_timer.as_mut(),
                 self.bluetooth,
                 self.connection,
-                self.metrics,
             )?;
-            let metrics_now = StdInstant::now();
-            self.metrics.set_pacing_blocked(timer_armed, metrics_now);
-            self.metrics.set_staging_blocked(
-                !output_closed && transmitter.remaining_capacity() == 0,
-                metrics_now,
-            );
-            self.metrics.set_window_blocked(
-                transmitter.has_buffered_data() && transmitter.window_full(),
-                metrics_now,
-            );
 
             if child_exited && output_closed && transmitter.is_drained() {
                 return Ok(SessionEnd::ChildExited);
@@ -271,18 +232,14 @@ impl<S: BluetoothSink> Bridge<'_, S> {
             tokio::select! {
                 biased;
                 () = self.shutdown.cancelled() => return Ok(SessionEnd::Shutdown),
-                _ = metrics_timer.tick() => {
-                    self.reporter.log_periodic(
-                        self.input_metrics,
-                        self.metrics,
-                        StdInstant::now(),
-                    );
-                }
                 event = self.events.recv() => {
                     let event = event.context("Bluetooth event channel closed")?;
                     if let Some(end) = self.handle_event(&mut transmitter, event)? {
                         return Ok(end);
                     }
+                }
+                () = &mut send_timer, if timer_armed => {
+                    timer_armed = false;
                 }
                 status = self.child.wait(), if !child_exited => {
                     status.context("wait for PTY child")?;
@@ -295,11 +252,11 @@ impl<S: BluetoothSink> Bridge<'_, S> {
                     if count == 0 {
                         output_closed = true;
                     } else {
-                        transmitter.append(&read_buffer[..count], StdInstant::now())?;
+                        if transmitter.is_drained() {
+                            self.egress.begin_burst(Instant::now())?;
+                        }
+                        transmitter.append(&read_buffer[..count])?;
                     }
-                }
-                () = &mut send_timer, if timer_armed => {
-                    timer_armed = false;
                 }
             }
         }
@@ -316,20 +273,11 @@ impl<S: BluetoothSink> Bridge<'_, S> {
                 token,
                 bytes_written,
                 status,
-                native_queue_latency,
-                flow_control_wait,
-                completion_latency,
             } if connection == self.connection => {
                 if status != 0 {
                     bail!("RFCOMM async write {token:?} failed with IOReturn {status:#x}");
                 }
                 transmitter.complete(token, bytes_written)?;
-                self.metrics.record_completion(
-                    native_queue_latency,
-                    flow_control_wait,
-                    completion_latency,
-                    StdInstant::now(),
-                );
                 Ok(None)
             }
             BtEvent::ConnectionError { connection, error } if connection == self.connection => {
@@ -357,29 +305,37 @@ fn schedule_next<S: BluetoothSink>(
     mut send_timer: Pin<&mut Sleep>,
     bluetooth: &S,
     connection: ConnectionId,
-    metrics: &mut OutputMetrics,
 ) -> Result<()> {
     if *timer_armed {
         return Ok(());
     }
+
     loop {
         if !transmitter.has_buffered_data() || transmitter.window_full() {
+            *timer_armed = false;
             return Ok(());
         }
 
         let now = Instant::now();
-        let deadline = egress.ready_at(now);
-        if deadline > now {
-            send_timer.as_mut().reset(deadline);
-            *timer_armed = true;
-            return Ok(());
-        }
+        let maximum_bytes = transmitter
+            .next_write_len()
+            .expect("buffered transmitter has a next write length");
+        let permit = match egress.reserve_up_to(maximum_bytes, now)? {
+            EgressDecision::Send(permit) => permit,
+            EgressDecision::WaitUntil(deadline) => {
+                if !*timer_armed || send_timer.deadline() != deadline {
+                    send_timer.as_mut().reset(deadline);
+                }
+                *timer_armed = true;
+                return Ok(());
+            }
+        };
 
-        let write = transmitter
-            .start_write()
-            .expect("buffered transmitter with window space can start a write");
-        egress.record_sent_at(write.data.len(), now)?;
-        submit_write(bluetooth, connection, write, metrics)?;
+        let byte_count = permit.byte_count();
+        let write = transmitter.start_write(byte_count)?;
+        submit_write(bluetooth, connection, write)?;
+        permit.commit(Instant::now());
+        *timer_armed = false;
     }
 }
 
@@ -387,19 +343,11 @@ fn submit_write<S: BluetoothSink>(
     bluetooth: &S,
     connection: ConnectionId,
     write: TxWrite,
-    metrics: &mut OutputMetrics,
 ) -> Result<()> {
-    let queued_at = StdInstant::now();
-    metrics.record_packet(
-        write.data.len(),
-        queued_at.saturating_duration_since(write.buffered_since),
-        queued_at,
-    );
     bluetooth.submit(BtCommand::Send {
         connection,
         token: write.token,
         data: write.data,
-        queued_at,
     })
 }
 
@@ -453,6 +401,6 @@ fn merge_join_failure(
 }
 
 #[cfg(test)]
-mod metrics_tests;
+mod scheduler_tests;
 #[cfg(test)]
 mod tx_tests;

@@ -1,8 +1,7 @@
-use std::collections::{HashMap, VecDeque};
+use std::collections::HashMap;
 use std::sync::atomic::{AtomicU64, Ordering};
-use std::time::Instant;
 
-use anyhow::{Result, bail};
+use anyhow::{Context, Result, bail};
 use bytes::{Bytes, BytesMut};
 
 use crate::bluetooth::WriteToken;
@@ -12,12 +11,6 @@ static NEXT_WRITE_TOKEN: AtomicU64 = AtomicU64::new(1);
 pub(super) struct TxWrite {
     pub(super) token: WriteToken,
     pub(super) data: Bytes,
-    pub(super) buffered_since: Instant,
-}
-
-struct BufferedSpan {
-    remaining: usize,
-    received_at: Instant,
 }
 
 /// A bounded byte-stream staging area with MTU packetization and write ownership.
@@ -26,7 +19,6 @@ pub(super) struct Transmitter {
     staging_limit: usize,
     write_window: usize,
     staging: BytesMut,
-    spans: VecDeque<BufferedSpan>,
     outstanding: HashMap<WriteToken, usize>,
 }
 
@@ -46,12 +38,11 @@ impl Transmitter {
             staging_limit,
             write_window,
             staging: BytesMut::with_capacity(staging_limit),
-            spans: VecDeque::new(),
             outstanding: HashMap::new(),
         })
     }
 
-    pub(super) fn append(&mut self, data: &[u8], received_at: Instant) -> Result<()> {
+    pub(super) fn append(&mut self, data: &[u8]) -> Result<()> {
         if data.is_empty() {
             bail!("cannot stage empty PTY output");
         }
@@ -59,10 +50,6 @@ impl Transmitter {
             bail!("PTY output exceeds its bounded staging budget");
         }
         self.staging.extend_from_slice(data);
-        self.spans.push_back(BufferedSpan {
-            remaining: data.len(),
-            received_at,
-        });
         Ok(())
     }
 
@@ -82,26 +69,26 @@ impl Transmitter {
     }
 
     #[must_use]
+    pub(super) fn next_write_len(&self) -> Option<usize> {
+        (!self.window_full() && !self.staging.is_empty()).then(|| self.mtu.min(self.staging.len()))
+    }
+
+    #[must_use]
     pub(super) fn is_drained(&self) -> bool {
         self.staging.is_empty() && self.outstanding.is_empty()
     }
 
-    pub(super) fn start_write(&mut self) -> Option<TxWrite> {
-        if self.window_full() || self.staging.is_empty() {
-            return None;
+    pub(super) fn start_write(&mut self, length: usize) -> Result<TxWrite> {
+        let maximum = self
+            .next_write_len()
+            .context("transmitter cannot start an RFCOMM write")?;
+        if length == 0 || length > maximum {
+            bail!("invalid RFCOMM write length {length}; available maximum is {maximum}");
         }
-
-        let length = self.mtu.min(self.staging.len());
-        let buffered_since = self.spans.front()?.received_at;
-        self.consume_spans(length);
         let data = self.staging.split_to(length).freeze();
         let token = next_write_token();
         self.outstanding.insert(token, length);
-        Some(TxWrite {
-            token,
-            data,
-            buffered_since,
-        })
+        Ok(TxWrite { token, data })
     }
 
     pub(super) fn complete(&mut self, token: WriteToken, bytes_written: usize) -> Result<()> {
@@ -116,21 +103,6 @@ impl Transmitter {
         }
         self.outstanding.remove(&token);
         Ok(())
-    }
-
-    fn consume_spans(&mut self, mut length: usize) {
-        while length > 0 {
-            let span = self
-                .spans
-                .front_mut()
-                .expect("staged bytes always have timestamp spans");
-            let consumed = length.min(span.remaining);
-            span.remaining -= consumed;
-            length -= consumed;
-            if span.remaining == 0 {
-                self.spans.pop_front();
-            }
-        }
     }
 }
 

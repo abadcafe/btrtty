@@ -26,8 +26,8 @@ macOS main thread                 Tokio runtime（2 workers）
 - data callback 只复制 payload 并尝试写入有界输入通道；close、flow-control 和 write-completion callback 只投递 native action，其中可重复的 flow/input-overflow hint 会合并。incoming-open callback 只建立 channel 所有权、delegate 和 close notification；所有应用状态转换都在 callback 栈外执行。任何 callback 都不操作 PTY、不等待、不执行 shell。
 - Tokio 命令经 `CFRunLoopSourceSignal` + `CFRunLoopWakeUp` 送回主线程，无轮询。
 - 每条连接都有不可复用的 `ConnectionId`；`Send`、`Close`、write completion、input 和 disconnect 全部带连接 ID。旧连接的延迟事件/命令不能命中新连接。首次 acceptance 在 listener publication 前已经 armed；之后只有上一条连接的真实 close callback 才能产生一次性的 reconnect permit。
-- RFCOMM 只使用 `writeAsync`，每次提交时才按实际 MTU 切块。outstanding window 按约 25 ms 的配置流量派生，至少覆盖一个 MTU，硬上限为 32。
-- PTY output 直接读入有字节上限的 staging buffer，不存在固定合并定时器或中间 chunk channel。限速器空闲时首批字节立即提交；持续输出在等待下一发送时刻期间自然合并，提交时尽量形成完整 MTU，字节内容和顺序不变。
+- RFCOMM 只使用 `writeAsync`，每次提交都不超过实际 MTU。outstanding command window 按约 25 ms 的配置流量和 1 ms pacing packet 派生，硬上限为 32。
+- PTY output 直接读入有字节上限的 staging buffer，不存在固定合并定时器或中间 chunk channel。限速器空闲时首批字节立即提交；持续输出只等待真实 pacing timer，timer 触发后立即提交当时 credit 允许的前缀，不等待凑满 MTU，字节内容和顺序不变。
 - SDP record 和 incoming listener 与长期运行的 btrtty 进程同寿命；普通 client disconnect 只销毁本次 PTY/bash，绝不重新发布 Bluetooth 服务。
 - 每个 active channel 都注册独立的 channel-close notification；actor 必须同时收到全部 outstanding write completions 和真实 channel-close callback，才会释放 channel 与 pending `Bytes`，这些事件无论以什么顺序到达都不能越过另一道屏障。超过单 active-client 限制的已打开 channel 也会被保留并等待真实 close callback，不会直接丢弃 Objective-C 对象。
 - 最终关闭顺序固定为：停止 PTY 和新 write → 等待全部 outstanding writes → 请求关闭已知 channel → 等待全部 channel-close callbacks → 删除 SDP record → 注销 incoming notification → 停止 CFRunLoop。不得提前报告 native shutdown 完成。
@@ -35,10 +35,9 @@ macOS main thread                 Tokio runtime（2 workers）
 - IOBluetooth 不提供枚举或取消 pre-open pending incoming connection 的公开 API。SIGINT/SIGTERM 的明确前置条件是操作者先停止 Linux 侧所有新连接和自动重试；btrtty 不包含虚假的 drain、延时轮询或 publish-remove-republish 清理。
 - 进程持有排他单实例锁；第二个 btrtty 会直接报错，不会与旧 listener 竞争或尝试接管其 channel。
 - 启动只发布一次 transient SDP record。所有可能失败的 CFRunLoop 基础设施在发布前创建；notification 注册失败时必须成功回滚本次 SDP record，否则启动直接报错。
-- Mac→Linux 默认限制为 20 KiB/s；空闲不会积累 burst，最多首个 RFCOMM MTU chunk 立即发送，调度进度跨 Bluetooth 重连保留。
+- Mac→Linux 默认限制为 20 KiB/s；空闲 credit 最多积累一个 RFCOMM MTU，首批小碎片共享这份 credit 并立即发送；持续输出由真实 pacing timer 驱动，timer 触发后立即发送 credit 允许的前缀而不等待凑满 MTU，并只保留至多一个 1 ms timer tick 的迟醒额度；调度进度跨 Bluetooth 重连保留。
 - PTY output staging 按限速值容纳约 100 ms 输出且至少一个 MTU；staging 满或 outstanding window 满时停止读取 PTY，通过 PTY/kernel 自然反压，不丢字符。
 - Linux→Mac payload 使用独立 Tokio input task 和 `128` 条 bounded input queue，不与 PTY output pacing 共用 `select!` 调度。队列满会关闭当前连接，不会无限增长；断线/退出会取消正在等待 PTY 可写的 future，旧连接残留输入在重新开放 accept gate 前清空。
-- active session 每 5 秒检查一次聚合性能指标，有新 input/output/completion 或仍处于反压状态时以 debug 级别输出 `phase=periodic` 快照；会话离开主 bridge 后立即输出 `phase=pre_cleanup`，完成 input task 与 PTY child 清理后输出 `phase=final`。默认 info 日志不显示这些快照；快照包含输入调度/PTY write、output staging、main-thread queue、flow-control、write completion 的延迟分布，以及 MTU 填充率、阻塞时间和有效速率，不记录 terminal payload。
 - SIGINT/SIGTERM handler 在 SDP publication 前完成安装。Tokio application task 即使 panic，watchdog 也会请求 native shutdown；PTY reader、child reap 和 native teardown 的错误均会返回，不会静默吞掉。
 
 ## 构建
@@ -95,9 +94,9 @@ dist/btrtty \
   --command '/opt/homebrew/bin/tmux -T RGB new-session -A -s btrtty'
 ```
 
-`--max-output-rate` 的单位是 KiB/s，取值范围为 `1..=200`，只限制 Mac→Linux 的输出。空闲期间不会积累发送额度；空闲后的首个至多 RFCOMM MTU 大小的 chunk 可以立即发送，后续 chunk 按配置速率调度。限速器属于整个进程，重连不会重置尚未到期的发送进度。
+`--max-output-rate` 的单位是 KiB/s，取值范围为 `1..=200`，只限制 Mac→Linux 的输出。空闲 credit 最多积累一个 RFCOMM MTU；空闲后的首批数据可以立即发送，后续数据按配置速率调度。限速器属于整个进程，重连不会重置现有 credit 或尚未到期的发送进度。
 
-PTY output staging 的字节上限为 `max(MTU, ceil(rate × 1024 × 100 ms))`。outstanding write window 为 `ceil(max(MTU, rate × 1024 × 25 ms) / MTU)`，并限制在 `1..=32`。这两者只是有界反压容量，不是可立即发送的 burst 额度；每次 write 仍按实际提交时间执行严格限速。
+PTY output staging 的字节上限为 `max(MTU, ceil(rate × 1024 × 100 ms))`。令 `pacing_packet = min(MTU, max(1, floor(rate × 1024 / 1000)))`，outstanding command window 为 `ceil(max(pacing_packet, ceil(rate × 1024 × 25 / 1000)) / pacing_packet)`，并限制在 `1..=32`。这两者只是有界反压容量，不是可立即发送的 burst 额度；限速 credit 只在 command queue 成功接受 write 后才扣除。native flow-control 暂停期间已按速率接纳的 bounded window 可在恢复后集中 drain，但累计接纳字节仍受同一限速器约束。
 
 默认值是 `exec /bin/bash -l`、24 行、80 列（即通常所说的 `80×24`）和 20 KiB/s。每次客户端连接创建的新 PTY 都以当前用户的 `$HOME` 为初始工作目录；`$HOME` 缺失或无效时会话创建失败。正常启动会显示系统动态分配的 RFCOMM channel：
 
@@ -189,10 +188,6 @@ tmux 必须明确获知外层支持 RGB，因此推荐命令使用 `tmux -T RGB`
 
 RFCOMM payload 与 PTY payload 一一对应：Ctrl-C、Ctrl-Z、Tab、方向键、UTF-8、NUL 和 ANSI 序列均不被 btrtty 解释。标准 `rfcomm`、`picocom`、`screen` 和 `minicom` 不需要了解 btrtty。
 
-默认日志为 info 且不包含 terminal payload。调试状态机可用：
-
-```bash
-RUST_LOG=btrtty=debug btrtty ...
-```
+运行日志不包含 terminal payload。
 
 真实 Mac + Linux Bluetooth 硬件验收步骤记录在 [docs/hardware-acceptance.md](docs/hardware-acceptance.md)。
