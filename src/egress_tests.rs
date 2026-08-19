@@ -236,8 +236,15 @@ fn test_permit_charges_at_successful_submission_time() {
     permit.commit(submitted_at);
 
     assert_eq!(
+        commit_send(
+            limiter.reserve_up_to(128, submitted_at).unwrap(),
+            submitted_at
+        ),
+        1
+    );
+    assert_eq!(
         wait_until(limiter.reserve_up_to(1, submitted_at).unwrap()),
-        submitted_at + Duration::from_nanos(976_563)
+        submitted_at + Duration::from_nanos(953_125)
     );
 }
 

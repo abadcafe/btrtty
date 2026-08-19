@@ -51,7 +51,7 @@ struct Bucket {
 pub(crate) struct EgressPermit<'a> {
     limiter: &'a mut EgressLimiter,
     byte_count: usize,
-    remaining_credit: u128,
+    credit: u128,
 }
 
 pub(crate) enum EgressDecision<'a> {
@@ -146,7 +146,7 @@ impl EgressLimiter {
         maximum_bytes: usize,
         now: Instant,
     ) -> Result<EgressDecision<'_>> {
-        let (byte_count, remaining_credit, deadline) = {
+        let (byte_count, credit, deadline) = {
             let bucket = self
                 .bucket
                 .as_mut()
@@ -160,7 +160,7 @@ impl EgressLimiter {
             if available_bytes > 0 {
                 let byte_count = maximum_bytes.min(available_bytes);
                 let cost = credit_for_bytes(byte_count)?;
-                (byte_count, bucket.credit - cost, None)
+                (byte_count, cost, None)
             } else {
                 let deficit = NANOS_PER_SECOND - bucket.credit;
                 (0, 0, Some(deficit))
@@ -171,7 +171,7 @@ impl EgressLimiter {
             return Ok(EgressDecision::Send(EgressPermit {
                 limiter: self,
                 byte_count,
-                remaining_credit,
+                credit,
             }));
         };
         let wait_nanos = deficit.div_ceil(u128::from(self.bytes_per_second));
@@ -205,8 +205,17 @@ impl EgressPermit<'_> {
             .bucket
             .as_mut()
             .expect("an egress permit requires a configured bucket");
-        bucket.credit = self.remaining_credit;
-        bucket.last_refill = submitted_at;
+        let credit_limit = active_credit_limit(bucket.capacity, self.limiter.bytes_per_second);
+        refill(
+            bucket,
+            self.limiter.bytes_per_second,
+            submitted_at,
+            credit_limit,
+        );
+        bucket.credit = bucket
+            .credit
+            .checked_sub(self.credit)
+            .expect("an admitted egress write retains enough credit until commit");
     }
 }
 
