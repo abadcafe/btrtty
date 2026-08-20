@@ -1,4 +1,5 @@
 use super::lifecycle::{Lifecycle, LifecycleAction};
+use super::types::MAX_RFCOMM_WRITE_COMMANDS;
 
 #[test]
 fn test_begin_shutdown_without_channel_withdraws_service() {
@@ -51,13 +52,13 @@ fn test_begin_shutdown_waits_for_write_before_channel_close() {
 fn test_begin_shutdown_waits_for_all_outstanding_writes() {
     let mut lifecycle = published_lifecycle();
     lifecycle.channel_opened().unwrap();
-    for _ in 0..32 {
+    for _ in 0..MAX_RFCOMM_WRITE_COMMANDS {
         lifecycle.write_started().unwrap();
     }
     assert!(lifecycle.write_started().is_err());
 
     assert_eq!(lifecycle.begin_shutdown().unwrap(), LifecycleAction::Wait);
-    for _ in 0..31 {
+    for _ in 1..MAX_RFCOMM_WRITE_COMMANDS {
         assert_eq!(lifecycle.write_completed().unwrap(), LifecycleAction::Wait);
     }
     assert_eq!(
@@ -112,12 +113,12 @@ fn test_remote_close_during_write_waits_for_write_completion() {
 fn test_remote_close_waits_for_all_outstanding_writes() {
     let mut lifecycle = published_lifecycle();
     lifecycle.channel_opened().unwrap();
-    for _ in 0..32 {
+    for _ in 0..MAX_RFCOMM_WRITE_COMMANDS {
         lifecycle.write_started().unwrap();
     }
 
     assert_eq!(lifecycle.channel_closed().unwrap(), LifecycleAction::Wait);
-    for _ in 0..31 {
+    for _ in 1..MAX_RFCOMM_WRITE_COMMANDS {
         assert_eq!(lifecycle.write_completed().unwrap(), LifecycleAction::Wait);
     }
     assert_eq!(

@@ -26,8 +26,8 @@ macOS main thread                 Tokio runtime（2 workers）
 - data callback 只复制 payload 并尝试写入有界输入通道；close、flow-control 和 write-completion callback 只投递 native action，其中可重复的 flow/input-overflow hint 会合并。incoming-open callback 只建立 channel 所有权、delegate 和 close notification；所有应用状态转换都在 callback 栈外执行。任何 callback 都不操作 PTY、不等待、不执行 shell。
 - Tokio 命令经 `CFRunLoopSourceSignal` + `CFRunLoopWakeUp` 送回主线程，无轮询。
 - 每条连接都有不可复用的 `ConnectionId`；`Send`、`Close`、write completion、input 和 disconnect 全部带连接 ID。旧连接的延迟事件/命令不能命中新连接。首次 acceptance 在 listener publication 前已经 armed；之后只有上一条连接的真实 close callback 才能产生一次性的 reconnect permit。
-- RFCOMM 只使用 `writeAsync`，每次提交都不超过实际 MTU，同时最多保留 32 个尚未完成的 write。Bluetooth flow control 或该窗口满时才停止继续提交。
-- PTY output 直接读入恰好一个 RFCOMM MTU 的 staging buffer，不存在限速器、发送 timer、固定合并 timer 或中间 chunk channel。只要 write window 有空间，读到的字节立即提交，内容和顺序不变。
+- RFCOMM 只使用 `writeAsync`，每次提交都不超过实际 MTU，同时最多保留 8 个尚未完成的 write。Bluetooth flow control 或该窗口满时停止继续提交。
+- PTY output 直接读入恰好一个 RFCOMM MTU 的 staging buffer，不存在限速器、发送 timer、固定合并 timer 或中间 chunk channel。空闲后的首个 partial packet 立即提交；它完成前，后续不足 MTU 的尾部字节留在 staging 中合并，完整 MTU packet 仍可流水发送。字节内容和顺序不变。
 - SDP record 和 incoming listener 与长期运行的 btrtty 进程同寿命；普通 client disconnect 只销毁本次 PTY/bash，绝不重新发布 Bluetooth 服务。
 - 每个 active channel 都注册独立的 channel-close notification；actor 必须同时收到全部 outstanding write completions 和真实 channel-close callback，才会释放 channel 与 pending `Bytes`，这些事件无论以什么顺序到达都不能越过另一道屏障。超过单 active-client 限制的已打开 channel 也会被保留并等待真实 close callback，不会直接丢弃 Objective-C 对象。
 - 最终关闭顺序固定为：停止 PTY 和新 write → 等待全部 outstanding writes → 请求关闭已知 channel → 等待全部 channel-close callbacks → 删除 SDP record → 注销 incoming notification → 停止 CFRunLoop。不得提前报告 native shutdown 完成。
@@ -35,7 +35,7 @@ macOS main thread                 Tokio runtime（2 workers）
 - IOBluetooth 不提供枚举或取消 pre-open pending incoming connection 的公开 API。SIGINT/SIGTERM 的明确前置条件是操作者先停止 Linux 侧所有新连接和自动重试；btrtty 不包含虚假的 drain、延时轮询或 publish-remove-republish 清理。
 - 进程持有排他单实例锁；第二个 btrtty 会直接报错，不会与旧 listener 竞争或尝试接管其 channel。
 - 启动只发布一次 transient SDP record。所有可能失败的 CFRunLoop 基础设施在发布前创建；notification 注册失败时必须成功回滚本次 SDP record，否则启动直接报错。
-- Mac→Linux 没有应用层限速。PTY staging 固定为一个实际 MTU；32 个 outstanding writes 全满后最多再从 PTY 读取一个 MTU，随后通过 PTY/kernel 自然反压，不丢字符。应用层已读取但尚未收到 completion 的总上限为 33 个 MTU。
+- Mac→Linux 没有应用层限速。PTY staging 固定为一个实际 MTU；8 个 outstanding writes 全满后最多再从 PTY 读取一个 MTU，随后通过 PTY/kernel 自然反压，不丢字符。应用层已读取但尚未收到 completion 的总上限为 9 个 MTU。
 - Linux→Mac payload 使用独立 Tokio input task 和 `128` 条 bounded input queue，不与 PTY output 调度共用 `select!`。队列满会关闭当前连接，不会无限增长；断线/退出会取消正在等待 PTY 可写的 future，旧连接残留输入在重新开放 accept gate 前清空。
 - SIGINT/SIGTERM handler 在 SDP publication 前完成安装。Tokio application task 即使 panic，watchdog 也会请求 native shutdown；PTY reader、child reap 和 native teardown 的错误均会返回，不会静默吞掉。
 
@@ -92,7 +92,9 @@ dist/btrtty \
   --command '/opt/homebrew/bin/tmux -T RGB new-session -A -s btrtty'
 ```
 
-Mac→Linux 不做应用层限速。PTY output staging 恰好容纳一个实际 RFCOMM MTU，outstanding command window 固定为 32。当前实机 MTU 为 667 时，应用层已读取但尚未完成的输出最多为 `33 × 667 = 22,011` 字节；超过边界后停止读取 PTY，由 kernel backpressure 阻塞输出源，不丢弃字节。
+Mac→Linux 不做应用层限速。PTY output staging 恰好容纳一个实际 RFCOMM MTU，outstanding command window 固定为 8。当前实机 MTU 为 667 时，应用层已读取但尚未完成的输出最多为 `9 × 667 = 6,003` 字节；超过边界后停止读取 PTY，由 kernel backpressure 阻塞输出源，不丢弃字节。
+
+发送端采用 event-driven tail coalescing：空闲后的第一批字节不等待；同一时刻最多有一个不足 MTU 的 write outstanding。这个 partial write 完成前，新尾部字节会在一个 MTU 的 staging 中自然合并，达到 MTU 时可以立即流水发送。它只改变 RFCOMM write 的分块边界，不改变 payload，也不按时间或字节速率限流。
 
 默认值是 `exec /bin/bash -l`、24 行、80 列（即通常所说的 `80×24`）。每次客户端连接创建的新 PTY 都以当前用户的 `$HOME` 为初始工作目录；`$HOME` 缺失或无效时会话创建失败。正常启动会显示系统动态分配的 RFCOMM channel：
 

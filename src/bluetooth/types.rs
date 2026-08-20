@@ -5,7 +5,9 @@ use std::str::FromStr;
 use bytes::Bytes;
 use thiserror::Error;
 
-pub(crate) const MAX_RFCOMM_WRITE_COMMANDS: usize = 32;
+// Keep the native queue shallow: write completion means that IOBluetooth has
+// passed the buffer to the hardware, not that the peer rendered the bytes.
+pub(crate) const MAX_RFCOMM_WRITE_COMMANDS: usize = 8;
 
 #[derive(Clone, Debug, Eq, Hash, PartialEq)]
 pub struct DeviceAddress(String);

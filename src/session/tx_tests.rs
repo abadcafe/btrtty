@@ -31,6 +31,50 @@ fn test_transmitter_exposes_idle_byte_immediately() {
 }
 
 #[test]
+fn test_transmitter_holds_a_second_partial_write_until_the_first_completes() {
+    let mut transmitter = Transmitter::new(64).unwrap();
+    transmitter.append(b"first").unwrap();
+    let first = start_next(&mut transmitter);
+
+    transmitter.append(b"second").unwrap();
+    assert!(transmitter.start_write().is_none());
+
+    transmitter.complete(first.token, first.data.len()).unwrap();
+    assert_eq!(&start_next(&mut transmitter).data[..], b"second");
+}
+
+#[test]
+fn test_transmitter_pipelines_full_mtu_while_a_partial_write_is_outstanding() {
+    let mut transmitter = Transmitter::new(8).unwrap();
+    transmitter.append(b"x").unwrap();
+    let partial = start_next(&mut transmitter);
+
+    transmitter.append(b"abcdefgh").unwrap();
+    let full = start_next(&mut transmitter);
+
+    assert_eq!(&partial.data[..], b"x");
+    assert_eq!(&full.data[..], b"abcdefgh");
+}
+
+#[test]
+fn test_transmitter_does_not_release_a_partial_on_an_unrelated_completion() {
+    let mut transmitter = Transmitter::new(8).unwrap();
+    transmitter.append(b"x").unwrap();
+    let partial = start_next(&mut transmitter);
+    transmitter.append(b"abcdefgh").unwrap();
+    let full = start_next(&mut transmitter);
+    transmitter.append(b"tail").unwrap();
+
+    transmitter.complete(full.token, full.data.len()).unwrap();
+    assert!(transmitter.start_write().is_none());
+
+    transmitter
+        .complete(partial.token, partial.data.len())
+        .unwrap();
+    assert_eq!(&start_next(&mut transmitter).data[..], b"tail");
+}
+
+#[test]
 fn test_transmitter_coalesces_fragments_until_submission() {
     let mut transmitter = Transmitter::new(8).unwrap();
     transmitter.append(b"a").unwrap();
@@ -75,6 +119,18 @@ fn test_transmitter_enforces_native_write_window() {
         .complete(writes[1].token, writes[1].data.len())
         .unwrap();
     assert_eq!(&start_next(&mut transmitter).data[..], b"cd");
+}
+
+#[test]
+fn test_transmitter_window_is_bounded_to_eight_writes() {
+    let mut transmitter = Transmitter::new(2).unwrap();
+
+    for _ in 0..8 {
+        transmitter.append(b"ab").unwrap();
+        let _ = start_next(&mut transmitter);
+    }
+
+    assert!(transmitter.window_full());
 }
 
 #[test]
