@@ -10,7 +10,6 @@ mod platform {
     use btrtty::app::{self, AppConfig};
     use btrtty::bluetooth::{BluetoothMainThread, BtCommand, INPUT_QUEUE_CAPACITY};
     use btrtty::cli::Cli;
-    use btrtty::egress::OutputRate;
     use btrtty::instance::InstanceLock;
     use btrtty::session::SessionConfig;
     use btrtty::shutdown;
@@ -42,7 +41,6 @@ mod platform {
         };
         let app_config = AppConfig {
             session: SessionConfig::new(args.command, args.rows, args.cols)?,
-            output_rate: OutputRate::new(args.max_output_rate)?,
         };
         let (event_sender, event_receiver) = mpsc::unbounded_channel();
         let (input_sender, input_receiver) = mpsc::channel(INPUT_QUEUE_CAPACITY);

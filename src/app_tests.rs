@@ -6,7 +6,6 @@ use tokio_util::sync::CancellationToken;
 
 use crate::app::{self, AppConfig};
 use crate::bluetooth::{BtCommand, BtEvent, BtInput, ConnectionId, DeviceAddress};
-use crate::egress::OutputRate;
 use crate::session::{BluetoothSink, SessionConfig};
 
 #[derive(Clone, Default)]
@@ -147,7 +146,6 @@ fn connected(connection: ConnectionId, paired: bool) -> BtEvent {
 fn config() -> AppConfig {
     AppConfig {
         session: SessionConfig::new("exec /bin/cat", 40, 120).unwrap(),
-        output_rate: OutputRate::new(20).unwrap(),
     }
 }
 

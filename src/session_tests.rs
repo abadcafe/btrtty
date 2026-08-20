@@ -3,11 +3,9 @@ use std::time::Duration;
 
 use bytes::Bytes;
 use tokio::sync::{Notify, mpsc};
-use tokio::time::Instant;
 use tokio_util::sync::CancellationToken;
 
 use crate::bluetooth::{BtCommand, BtError, BtEvent, BtInput, ConnectionId};
-use crate::egress::{EgressLimiter, OutputRate};
 use crate::session::{BluetoothSink, SessionConfig, SessionEnd, SessionRequest, run_session};
 
 #[derive(Clone, Default)]
@@ -33,7 +31,6 @@ async fn test_run_session_transfers_raw_rfcomm_bytes() {
     let (input_tx, input_rx) = mpsc::channel(8);
     let _input_keepalive = input_tx.clone();
     let shutdown = CancellationToken::new();
-    let mut limiter = test_limiter();
     let config =
         SessionConfig::new("stty raw -echo; printf READY; exec /bin/cat", 40, 120).unwrap();
     let payload = Bytes::from_static("中文\0\x1b[A\n".as_bytes());
@@ -43,7 +40,6 @@ async fn test_run_session_transfers_raw_rfcomm_bytes() {
         input_rx,
         sink,
         SessionRequest::new(config, connection, 4, shutdown),
-        &mut limiter,
     );
     let drive = async move {
         let mut received = Vec::new();
@@ -97,7 +93,6 @@ async fn test_run_session_delivers_raw_ctrl_c() {
     let (input_tx, input_rx) = mpsc::channel(8);
     let _input_keepalive = input_tx.clone();
     let shutdown = CancellationToken::new();
-    let mut limiter = test_limiter();
     let config = SessionConfig::new(
         "trap 'printf INTERRUPTED; sleep 0.1; exit 0' INT; printf READY; while :; do sleep 1; done",
         40,
@@ -110,7 +105,6 @@ async fn test_run_session_delivers_raw_ctrl_c() {
         input_rx,
         sink,
         SessionRequest::new(config, connection, 127, shutdown),
-        &mut limiter,
     );
     let drive = async move {
         let mut received = Vec::new();
@@ -182,7 +176,6 @@ async fn test_run_session_flushes_output_after_child_exit() {
     let (event_tx, mut event_rx) = mpsc::unbounded_channel();
     let _event_keepalive = event_tx.clone();
     let (_input_tx, input_rx) = mpsc::channel(1);
-    let mut limiter = test_limiter();
     let config = SessionConfig::new("printf FINAL_OUTPUT", 40, 120).unwrap();
 
     let session = run_session(
@@ -190,7 +183,6 @@ async fn test_run_session_flushes_output_after_child_exit() {
         input_rx,
         sink,
         SessionRequest::new(config, connection, 127, CancellationToken::new()),
-        &mut limiter,
     );
     let drive = async move {
         let mut output = Vec::new();
@@ -222,7 +214,6 @@ async fn test_run_session_cancellation_stops_child() {
     let (_event_tx, mut event_rx) = mpsc::unbounded_channel();
     let (_input_tx, input_rx) = mpsc::channel(1);
     let shutdown = CancellationToken::new();
-    let mut limiter = test_limiter();
     let cancel = shutdown.clone();
     let config = SessionConfig::new("exec /bin/sleep 60", 40, 120).unwrap();
 
@@ -231,7 +222,6 @@ async fn test_run_session_cancellation_stops_child() {
         input_rx,
         sink,
         SessionRequest::new(config, connection, 127, shutdown),
-        &mut limiter,
     );
     let trigger = async move {
         tokio::time::sleep(Duration::from_millis(25)).await;
@@ -255,7 +245,6 @@ async fn test_shutdown_cancels_blocked_pty_input_write() {
     }
     let shutdown = CancellationToken::new();
     let cancel = shutdown.clone();
-    let mut limiter = test_limiter();
     let config = SessionConfig::new("stty raw -echo; exec /bin/sleep 60", 40, 120).unwrap();
 
     let session = run_session(
@@ -263,7 +252,6 @@ async fn test_shutdown_cancels_blocked_pty_input_write() {
         input_rx,
         sink,
         SessionRequest::new(config, connection, 4096, shutdown),
-        &mut limiter,
     );
     let trigger = async move {
         tokio::time::sleep(Duration::from_millis(50)).await;
@@ -284,7 +272,6 @@ async fn test_run_session_prefers_matching_disconnect_over_child_exit() {
     let sink = ObservableSink::default();
     let (event_tx, mut event_rx) = mpsc::unbounded_channel();
     let (_input_tx, input_rx) = mpsc::channel(1);
-    let mut limiter = test_limiter();
     let config = SessionConfig::new("exit 0", 40, 120).unwrap();
 
     event_tx.send(BtEvent::Disconnected { connection }).unwrap();
@@ -293,7 +280,6 @@ async fn test_run_session_prefers_matching_disconnect_over_child_exit() {
         input_rx,
         sink,
         SessionRequest::new(config, connection, 127, CancellationToken::new()),
-        &mut limiter,
     )
     .await
     .unwrap();
@@ -308,7 +294,6 @@ async fn test_run_session_ignores_stale_disconnect() {
     let sink = ObservableSink::default();
     let (event_tx, mut event_rx) = mpsc::unbounded_channel();
     let (_input_tx, input_rx) = mpsc::channel(1);
-    let mut limiter = test_limiter();
     let config = SessionConfig::new("exec /bin/sleep 60", 40, 120).unwrap();
     event_tx
         .send(BtEvent::Disconnected { connection: stale })
@@ -320,7 +305,6 @@ async fn test_run_session_ignores_stale_disconnect() {
         input_rx,
         sink,
         SessionRequest::new(config, connection, 127, CancellationToken::new()),
-        &mut limiter,
     )
     .await
     .unwrap();
@@ -334,7 +318,6 @@ async fn test_connection_error_ends_only_the_matching_session() {
     let sink = ObservableSink::default();
     let (event_tx, mut event_rx) = mpsc::unbounded_channel();
     let (_input_tx, input_rx) = mpsc::channel(1);
-    let mut limiter = test_limiter();
     let config = SessionConfig::new("exec /bin/sleep 60", 40, 120).unwrap();
     event_tx
         .send(BtEvent::ConnectionError {
@@ -348,103 +331,10 @@ async fn test_connection_error_ends_only_the_matching_session() {
         input_rx,
         sink,
         SessionRequest::new(config, connection, 127, CancellationToken::new()),
-        &mut limiter,
     )
     .await
     .unwrap();
     assert_eq!(result.end, SessionEnd::ConnectionFailed(error));
-}
-
-#[tokio::test]
-async fn test_run_session_limits_sustained_output() {
-    let connection = connection(9);
-    let sink = ObservableSink::default();
-    let observer = sink.clone();
-    let (event_tx, mut event_rx) = mpsc::unbounded_channel();
-    let (_input_tx, input_rx) = mpsc::channel(1);
-    let mut limiter = EgressLimiter::new(OutputRate::new(1).unwrap());
-    let config = SessionConfig::new(
-        "dd if=/dev/zero bs=1024 count=1 2>/dev/null; sleep 5",
-        40,
-        120,
-    )
-    .unwrap();
-    let started = Instant::now();
-
-    let session = run_session(
-        &mut event_rx,
-        input_rx,
-        sink,
-        SessionRequest::new(config, connection, 256, CancellationToken::new()),
-        &mut limiter,
-    );
-    let drive = async move {
-        let mut received = 0;
-        while received < 1024 {
-            for command in next_commands(&observer).await {
-                if let BtCommand::Send { token, data, .. } = command {
-                    received += data.len();
-                    acknowledge(&event_tx, connection, token, data.len());
-                }
-            }
-        }
-        assert!(started.elapsed() >= Duration::from_millis(650));
-        event_tx.send(BtEvent::Disconnected { connection }).unwrap();
-    };
-
-    let (result, ()) = tokio::time::timeout(Duration::from_secs(4), async {
-        tokio::join!(session, drive)
-    })
-    .await
-    .expect("rate-limited PTY output timed out");
-    assert_eq!(result.unwrap().end, SessionEnd::Disconnected);
-}
-
-#[tokio::test]
-async fn test_run_session_submits_rate_derived_window_before_completion() {
-    let connection = connection(11);
-    let sink = ObservableSink::default();
-    let observer = sink.clone();
-    let (event_tx, mut event_rx) = mpsc::unbounded_channel();
-    let (_input_tx, input_rx) = mpsc::channel(1);
-    let mut limiter = test_limiter();
-    let config = SessionConfig::new(
-        "dd if=/dev/zero bs=4096 count=1 2>/dev/null; sleep 5",
-        40,
-        120,
-    )
-    .unwrap();
-
-    let session = run_session(
-        &mut event_rx,
-        input_rx,
-        sink,
-        SessionRequest::new(config, connection, 64, CancellationToken::new()),
-        &mut limiter,
-    );
-    let drive = async move {
-        let mut outstanding = Vec::new();
-        while outstanding.len() < 32 {
-            for command in next_commands(&observer).await {
-                if let BtCommand::Send { token, data, .. } = command {
-                    assert!(!data.is_empty());
-                    assert!(data.len() <= 64);
-                    outstanding.push((token, data.len()));
-                }
-            }
-        }
-        for (token, len) in outstanding {
-            acknowledge(&event_tx, connection, token, len);
-        }
-        event_tx.send(BtEvent::Disconnected { connection }).unwrap();
-    };
-
-    let (result, ()) = tokio::time::timeout(Duration::from_secs(5), async {
-        tokio::join!(session, drive)
-    })
-    .await
-    .expect("rate-derived RFCOMM window timed out");
-    assert_eq!(result.unwrap().end, SessionEnd::Disconnected);
 }
 
 async fn assert_session_output(command: &str, expected: &'static [u8], rows: u16, cols: u16) {
@@ -453,14 +343,12 @@ async fn assert_session_output(command: &str, expected: &'static [u8], rows: u16
     let observer = sink.clone();
     let (event_tx, mut event_rx) = mpsc::unbounded_channel();
     let (_input_tx, input_rx) = mpsc::channel(1);
-    let mut limiter = test_limiter();
     let config = SessionConfig::new(command, rows, cols).unwrap();
     let session = run_session(
         &mut event_rx,
         input_rx,
         sink,
         SessionRequest::new(config, connection, 127, CancellationToken::new()),
-        &mut limiter,
     );
     let drive = async move {
         let mut received = Vec::new();
@@ -487,10 +375,6 @@ async fn assert_session_output(command: &str, expected: &'static [u8], rows: u16
     .await
     .expect("PTY output assertion timed out");
     assert_eq!(result.unwrap().end, SessionEnd::Disconnected);
-}
-
-fn test_limiter() -> EgressLimiter {
-    EgressLimiter::new(OutputRate::new(100).unwrap())
 }
 
 async fn next_commands(sink: &ObservableSink) -> Vec<BtCommand> {

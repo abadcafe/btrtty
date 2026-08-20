@@ -6,13 +6,11 @@ use tokio_util::sync::CancellationToken;
 use tracing::{info, warn};
 
 use crate::bluetooth::{BtCommand, BtEvent, BtInput, ConnectionId, DeviceAddress};
-use crate::egress::{EgressLimiter, OutputRate};
 use crate::session::{BluetoothSink, SessionConfig, SessionEnd, SessionRequest, run_session};
 
 #[derive(Clone, Debug)]
 pub struct AppConfig {
     pub session: SessionConfig,
-    pub output_rate: OutputRate,
 }
 
 #[derive(Debug)]
@@ -57,7 +55,6 @@ pub fn start<S: BluetoothSink>(
         events,
         input: Some(input),
         bluetooth,
-        egress: EgressLimiter::new(config.output_rate),
         config,
         shutdown,
     };
@@ -68,7 +65,6 @@ struct Server<S> {
     events: mpsc::UnboundedReceiver<BtEvent>,
     input: Option<mpsc::Receiver<BtInput>>,
     bluetooth: S,
-    egress: EgressLimiter,
     config: AppConfig,
     shutdown: CancellationToken,
 }
@@ -162,7 +158,6 @@ impl<S: BluetoothSink> Server<S> {
                 mtu,
                 self.shutdown.clone(),
             ),
-            &mut self.egress,
         )
         .await?;
         self.input = Some(outcome.input);

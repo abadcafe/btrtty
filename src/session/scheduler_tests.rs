@@ -1,12 +1,8 @@
 use std::sync::{Arc, Mutex};
-use std::time::Duration;
-
-use tokio::time::Instant;
 
 use super::tx::Transmitter;
 use super::{BluetoothSink, schedule_next};
-use crate::bluetooth::{BtCommand, ConnectionId};
-use crate::egress::{EgressLimiter, OutputRate};
+use crate::bluetooth::{BtCommand, ConnectionId, MAX_RFCOMM_WRITE_COMMANDS};
 
 #[derive(Clone, Default)]
 struct RecordingSink {
@@ -20,40 +16,38 @@ impl BluetoothSink for RecordingSink {
     }
 }
 
-#[tokio::test]
-async fn test_only_the_timer_branch_can_release_an_armed_pacing_wait() {
-    let now = Instant::now();
-    let mut limiter = EgressLimiter::new(OutputRate::new(200).unwrap());
-    limiter.configure_mtu(128, now).unwrap();
-    let mut transmitter = Transmitter::new(128, 128, 1).unwrap();
-    transmitter.append(b"x").unwrap();
+#[test]
+fn test_schedule_next_submits_buffered_output_immediately() {
+    let mut transmitter = Transmitter::new(128).unwrap();
+    transmitter.append(&[b'x'; 128]).unwrap();
     let sink = RecordingSink::default();
-    let send_timer = tokio::time::sleep_until(now - Duration::from_millis(1));
-    tokio::pin!(send_timer);
-    let mut timer_armed = true;
+
+    schedule_next(&mut transmitter, &sink, ConnectionId::new(1).unwrap()).unwrap();
+
+    let commands = sink.commands.lock().unwrap();
+    assert_eq!(commands.len(), 1);
+    let BtCommand::Send { data, .. } = &commands[0] else {
+        panic!("scheduler submitted a non-write command");
+    };
+    assert_eq!(data.len(), 128);
+}
+
+#[test]
+fn test_schedule_next_stops_at_native_window_with_one_staged_mtu() {
+    let mut transmitter = Transmitter::new(128).unwrap();
+    let sink = RecordingSink::default();
     let connection = ConnectionId::new(1).unwrap();
 
-    schedule_next(
-        &mut transmitter,
-        &mut limiter,
-        &mut timer_armed,
-        send_timer.as_mut(),
-        &sink,
-        connection,
-    )
-    .unwrap();
-    assert!(sink.commands.lock().unwrap().is_empty());
+    for _ in 0..MAX_RFCOMM_WRITE_COMMANDS {
+        transmitter.append(&[b'x'; 128]).unwrap();
+        schedule_next(&mut transmitter, &sink, connection).unwrap();
+    }
+    transmitter.append(&[b'y'; 128]).unwrap();
+    schedule_next(&mut transmitter, &sink, connection).unwrap();
 
-    // This is the state transition performed by the selected Sleep branch.
-    timer_armed = false;
-    schedule_next(
-        &mut transmitter,
-        &mut limiter,
-        &mut timer_armed,
-        send_timer.as_mut(),
-        &sink,
-        connection,
-    )
-    .unwrap();
-    assert_eq!(sink.commands.lock().unwrap().len(), 1);
+    assert_eq!(
+        sink.commands.lock().unwrap().len(),
+        MAX_RFCOMM_WRITE_COMMANDS
+    );
+    assert_eq!(transmitter.remaining_capacity(), 0);
 }
