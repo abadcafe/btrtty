@@ -19,10 +19,17 @@ impl AcceptanceGate {
         }
     }
 
-    pub(super) fn arm(&mut self, after: ConnectionId) {
+    pub(super) fn arm(&mut self, after: ConnectionId) -> bool {
         if matches!(self.state, State::Awaiting(expected) if expected == after) {
             self.state = State::Armed;
+            true
+        } else {
+            false
         }
+    }
+
+    pub(super) fn is_awaiting(&self, after: ConnectionId) -> bool {
+        matches!(self.state, State::Awaiting(expected) if expected == after)
     }
 
     pub(super) const fn is_armed(&self) -> bool {
@@ -65,60 +72,5 @@ impl AcceptanceGate {
 
     pub(super) const fn is_stopped(&self) -> bool {
         matches!(self.state, State::Stopped)
-    }
-}
-
-#[cfg(test)]
-mod tests {
-    use super::AcceptanceGate;
-    use crate::bluetooth::types::ConnectionId;
-
-    #[test]
-    fn initial_acceptance_is_armed_before_publication() {
-        let mut gate = AcceptanceGate::new();
-        assert!(gate.begin_connection());
-        assert!(!gate.begin_connection());
-    }
-
-    #[test]
-    fn reconnect_requires_exact_closed_connection() {
-        let mut gate = busy_gate();
-        gate.connection_closed(connection(7)).unwrap();
-
-        gate.arm(connection(6));
-        assert!(!gate.begin_connection());
-        gate.arm(connection(7));
-        assert!(gate.begin_connection());
-    }
-
-    #[test]
-    fn duplicate_reconnect_permit_cannot_open_two_connections() {
-        let mut gate = busy_gate();
-        gate.connection_closed(connection(8)).unwrap();
-        gate.arm(connection(8));
-        gate.arm(connection(8));
-
-        assert!(gate.begin_connection());
-        assert!(!gate.begin_connection());
-    }
-
-    #[test]
-    fn shutdown_permanently_closes_gate() {
-        let mut gate = AcceptanceGate::new();
-        gate.stop();
-        gate.arm(connection(1));
-
-        assert!(gate.is_stopped());
-        assert!(!gate.begin_connection());
-    }
-
-    fn busy_gate() -> AcceptanceGate {
-        let mut gate = AcceptanceGate::new();
-        assert!(gate.begin_connection());
-        gate
-    }
-
-    fn connection(value: u64) -> ConnectionId {
-        ConnectionId::new(value).unwrap()
     }
 }

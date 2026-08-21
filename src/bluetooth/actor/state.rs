@@ -10,6 +10,7 @@ use crate::bluetooth::lifecycle::Lifecycle;
 use crate::bluetooth::types::{BtError, ConnectionId, WriteToken};
 
 use super::acceptance::AcceptanceGate;
+use super::listener::IncomingListener;
 
 pub(super) struct PendingWrite {
     pub(super) connection: ConnectionId,
@@ -40,7 +41,6 @@ pub(super) enum DelegateState {
 #[derive(Clone, Copy, Eq, PartialEq)]
 pub(super) enum DeliveryState {
     Ready,
-    InvalidListener,
     InputOverflow,
     Closed,
 }
@@ -60,10 +60,10 @@ pub(super) struct RejectedChannel {
 
 pub(super) struct ActorState {
     pub(super) service_record: Option<Retained<IOBluetoothSDPServiceRecord>>,
-    pub(super) incoming_notification: Option<Retained<IOBluetoothUserNotification>>,
-    pub(super) delivered: HashMap<usize, DeliveredChannel>,
+    pub(super) incoming_listener: Option<IncomingListener>,
+    pub(super) delivered: HashMap<u64, DeliveredChannel>,
     pub(super) active: Option<ActiveChannel>,
-    pub(super) rejected: HashMap<usize, RejectedChannel>,
+    pub(super) rejected: HashMap<u64, RejectedChannel>,
     pub(super) queued_writes: VecDeque<PendingWrite>,
     pub(super) pending_writes: HashMap<WriteToken, PendingWrite>,
     pub(super) retired_writes: std::collections::HashSet<WriteToken>,
@@ -77,7 +77,7 @@ impl Default for ActorState {
     fn default() -> Self {
         Self {
             service_record: None,
-            incoming_notification: None,
+            incoming_listener: None,
             delivered: HashMap::new(),
             active: None,
             rejected: HashMap::new(),

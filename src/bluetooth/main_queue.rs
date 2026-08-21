@@ -1,10 +1,12 @@
 use std::ffi::c_void;
+use std::time::Duration;
 
 use anyhow::{Context, Result};
 use objc2::MainThreadMarker;
 use objc2::rc::{Retained as ObjcRetained, autoreleasepool};
 use objc2_core_foundation::{
-    CFRetained, CFRunLoop, CFRunLoopSource, CFRunLoopSourceContext, kCFRunLoopCommonModes,
+    CFAbsoluteTimeGetCurrent, CFRetained, CFRunLoop, CFRunLoopSource, CFRunLoopSourceContext,
+    CFRunLoopTimer, CFRunLoopTimerContext, kCFRunLoopCommonModes,
 };
 use objc2_io_bluetooth::IOBluetoothHostController;
 use tokio::sync::mpsc;
@@ -16,6 +18,23 @@ use super::types::{BtCommand, BtEvent, BtInput, DeviceAddress};
 struct SourceContext {
     actor: ObjcRetained<BluetoothActor>,
     dispatcher: Dispatcher,
+    listener_timer: Option<CFRetained<CFRunLoopTimer>>,
+}
+
+const LISTENER_DORMANT_INTERVAL: Duration = Duration::from_secs(24 * 60 * 60);
+
+impl SourceContext {
+    fn schedule_listener_timer(&self) {
+        let Some(timer) = self.listener_timer.as_ref() else {
+            return;
+        };
+        let delay = if self.actor.listener_refresh_due() {
+            super::actor::LISTENER_REFRESH_INTERVAL
+        } else {
+            LISTENER_DORMANT_INTERVAL
+        };
+        timer.set_next_fire_date(CFAbsoluteTimeGetCurrent() + delay.as_secs_f64());
+    }
 }
 
 pub struct BluetoothMainThread {
@@ -52,7 +71,11 @@ impl BluetoothMainThread {
             .context("parse local Bluetooth controller address")?;
         let dispatcher = Dispatcher::new();
         let actor = BluetoothActor::new(event_sender, input_sender, dispatcher.native_queue(), mtm);
-        let mut context = Box::new(SourceContext { actor, dispatcher });
+        let mut context = Box::new(SourceContext {
+            actor,
+            dispatcher,
+            listener_timer: None,
+        });
         let mut source_context = CFRunLoopSourceContext {
             version: 0,
             info: std::ptr::from_mut(&mut *context).cast::<c_void>(),
@@ -70,6 +93,28 @@ impl BluetoothMainThread {
         let source =
             unsafe { CFRunLoopSource::new(None, 0, std::ptr::from_mut(&mut source_context)) }
                 .context("create CFRunLoop command source")?;
+        let mut timer_context = CFRunLoopTimerContext {
+            version: 0,
+            info: std::ptr::from_mut(&mut *context).cast::<c_void>(),
+            retain: None,
+            release: None,
+            copyDescription: None,
+        };
+        // SAFETY: `context` has a stable boxed address and outlives the timer.
+        // The timer is removed and invalidated before that box is dropped.
+        let listener_timer = unsafe {
+            CFRunLoopTimer::new(
+                None,
+                CFAbsoluteTimeGetCurrent() + super::actor::LISTENER_REFRESH_INTERVAL.as_secs_f64(),
+                LISTENER_DORMANT_INTERVAL.as_secs_f64(),
+                0,
+                0,
+                Some(refresh_listener),
+                std::ptr::from_mut(&mut timer_context),
+            )
+        }
+        .context("create RFCOMM listener refresh timer")?;
+        context.listener_timer = Some(listener_timer);
         let run_loop = CFRunLoop::main().context("obtain macOS main CFRunLoop")?;
         // SAFETY: This process is running on macOS and Core Foundation exports
         // the standard common-modes constant for the lifetime of the process.
@@ -87,6 +132,8 @@ impl BluetoothMainThread {
             .publish()
             .context("publish Bluetooth SPP service")?;
         run_loop.add_source(Some(&source), Some(common_modes));
+        run_loop.add_timer(context.listener_timer.as_deref(), Some(common_modes));
+        context.schedule_listener_timer();
 
         let queue = context.dispatcher.command_queue();
         Ok(Self {
@@ -133,6 +180,13 @@ impl BluetoothMainThread {
     }
 
     fn teardown(&mut self) -> Result<()> {
+        if let Some(timer) = self.context.listener_timer.take() {
+            // SAFETY: Same process-lifetime constant used when adding the timer.
+            if let Some(common_modes) = unsafe { kCFRunLoopCommonModes } {
+                self.run_loop.remove_timer(Some(&timer), Some(common_modes));
+            }
+            timer.invalidate();
+        }
         self.context.dispatcher.deactivate()?;
         // SAFETY: Same process-lifetime constant used when adding the source.
         if let Some(common_modes) = unsafe { kCFRunLoopCommonModes } {
@@ -180,4 +234,16 @@ unsafe extern "C-unwind" fn perform_commands(info: *mut c_void) {
             }
         }
     }
+    context.schedule_listener_timer();
+}
+
+unsafe extern "C-unwind" fn refresh_listener(_timer: *mut CFRunLoopTimer, info: *mut c_void) {
+    if info.is_null() {
+        return;
+    }
+    // SAFETY: `info` points at BluetoothMainThread's boxed SourceContext,
+    // which is stable until the timer is removed and invalidated.
+    let context = unsafe { &*(info.cast::<SourceContext>()) };
+    autoreleasepool(|_| context.actor.refresh_incoming_listener());
+    context.schedule_listener_timer();
 }

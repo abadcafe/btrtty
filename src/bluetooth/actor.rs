@@ -1,5 +1,6 @@
 use std::cell::RefCell;
 use std::ffi::c_void;
+use std::time::Instant;
 
 use anyhow::{Result, anyhow, bail};
 use bytes::Bytes;
@@ -20,12 +21,20 @@ use super::sdp;
 use super::types::{BtCommand, BtError, BtEvent, BtInput, ConnectionId};
 
 mod acceptance;
+#[cfg(test)]
+mod acceptance_tests;
 mod channel;
+mod listener;
+#[cfg(test)]
+mod listener_tests;
 mod shutdown;
 mod state;
 mod tx;
 
+use listener::IncomingListener;
 use state::ActorState;
+
+pub(super) const LISTENER_REFRESH_INTERVAL: std::time::Duration = listener::REFRESH_INTERVAL;
 
 pub(super) struct PublishedEndpoint {
     pub(super) record_handle: u32,
@@ -201,17 +210,7 @@ impl BluetoothActor {
 
     pub(super) fn publish(&self) -> Result<PublishedEndpoint> {
         let service = sdp::publish()?;
-        let object: &AnyObject = self;
-        // SAFETY: The selector is implemented above and the actor remains
-        // retained until after explicit unregistration.
-        let notification = unsafe {
-            IOBluetoothRFCOMMChannel::registerForChannelOpenNotifications_selector_withChannelID_direction(
-                Some(object),
-                Some(sel!(newRFCOMMChannelOpened:channel:)),
-                service.channel_id,
-                IOBluetoothUserNotificationChannelDirection::Incoming,
-            )
-        };
+        let notification = self.register_incoming_notification(service.channel_id);
         let Some(notification) = notification else {
             // SAFETY: This process owns the freshly published record.
             let rollback_status = unsafe { service.record.removeServiceRecord() };
@@ -236,11 +235,98 @@ impl BluetoothActor {
             return Err(error);
         }
         state.service_record = Some(service.record);
-        state.incoming_notification = Some(notification);
+        state.incoming_listener = Some(IncomingListener::new(
+            service.channel_id,
+            notification,
+            Instant::now(),
+        ));
         Ok(PublishedEndpoint {
             record_handle: service.record_handle,
             channel_id: service.channel_id,
         })
+    }
+
+    pub(super) fn register_incoming_notification(
+        &self,
+        channel_id: u8,
+    ) -> Option<Retained<IOBluetoothUserNotification>> {
+        let object: &AnyObject = self;
+        // SAFETY: The selector is implemented above and the actor remains
+        // retained until the returned notification is explicitly unregistered.
+        unsafe {
+            IOBluetoothRFCOMMChannel::registerForChannelOpenNotifications_selector_withChannelID_direction(
+                Some(object),
+                Some(sel!(newRFCOMMChannelOpened:channel:)),
+                channel_id,
+                IOBluetoothUserNotificationChannelDirection::Incoming,
+            )
+        }
+    }
+
+    /// Whether the native compatibility timer should schedule another public
+    /// RFCOMM notification registration.
+    pub(super) fn listener_refresh_due(&self) -> bool {
+        let state = self.ivars().state.borrow();
+        state.fatal_error.is_none()
+            && state.incoming_listener.is_some()
+            && state.acceptance.is_armed()
+            && state.active.is_none()
+            && state.delivered.is_empty()
+            && state.rejected.is_empty()
+    }
+
+    /// Re-announce readiness to bluetoothd while no connection is active.
+    ///
+    /// macOS 15 can discard the daemon-side accept session created by an
+    /// otherwise live `IOBluetoothUserNotification`. Repeating the public
+    /// registration while waiting lets the next generation consume an
+    /// incoming request that bluetoothd has parked in the meantime.
+    pub(super) fn refresh_incoming_listener(&self) {
+        let channel_id = {
+            let state = self.ivars().state.borrow();
+            if !self.listener_refresh_due() {
+                return;
+            }
+            state
+                .incoming_listener
+                .as_ref()
+                .expect("listener refresh eligibility was checked")
+                .channel_id()
+        };
+
+        let Some(notification) = self.register_incoming_notification(channel_id) else {
+            self.emit_fatal("refresh incoming RFCOMM channel notification", -1);
+            return;
+        };
+
+        let retired = {
+            let mut state = self.ivars().state.borrow_mut();
+            let still_waiting = state.fatal_error.is_none()
+                && state.acceptance.is_armed()
+                && state.active.is_none()
+                && state.delivered.is_empty()
+                && state.rejected.is_empty();
+            if !still_waiting {
+                drop(state);
+                // SAFETY: This generation was never installed in actor state.
+                unsafe { notification.unregister() };
+                return;
+            }
+            let Some(listener) = state.incoming_listener.as_mut() else {
+                drop(state);
+                // SAFETY: Shutdown removed the listener while registration was
+                // in progress; this returned generation remains actor-owned.
+                unsafe { notification.unregister() };
+                return;
+            };
+            listener.install(notification, Instant::now())
+        };
+
+        for notification in retired {
+            // SAFETY: The callback grace period elapsed and a newer generation
+            // is already retained by the main-thread actor.
+            unsafe { notification.unregister() };
+        }
     }
 
     pub(super) fn handle(&self, command: BtCommand) {
@@ -279,7 +365,7 @@ impl BluetoothActor {
     pub(super) fn finish(&self) -> Result<()> {
         let state = self.ivars().state.borrow();
         state.lifecycle.ensure_stopped()?;
-        if state.incoming_notification.is_some() {
+        if state.incoming_listener.is_some() {
             bail!("Bluetooth shutdown ended with an incoming listener registered");
         }
         if state.service_record.is_some() {

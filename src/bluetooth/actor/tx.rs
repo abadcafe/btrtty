@@ -50,7 +50,7 @@ impl BluetoothActor {
         self.submit_write(&channel, write);
     }
 
-    pub(super) fn flow_available(&self, key: usize) {
+    pub(super) fn flow_available(&self, key: u64) {
         loop {
             let (channel, write) = {
                 let mut state = self.ivars().state.borrow_mut();
@@ -121,7 +121,7 @@ impl BluetoothActor {
 
     pub(super) fn write_completed(
         &self,
-        key: usize,
+        key: u64,
         refcon: usize,
         status: i32,
         actual: Option<usize>,

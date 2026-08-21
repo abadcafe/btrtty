@@ -9,22 +9,22 @@ use super::types::BtCommand;
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub(super) enum NativeAction {
     OpenDelivered {
-        channel_key: usize,
+        channel_key: u64,
     },
     ChannelClosed {
-        channel_key: usize,
+        channel_key: u64,
     },
     WriteCompleted {
-        channel_key: usize,
+        channel_key: u64,
         refcon: usize,
         status: i32,
         bytes_written: Option<usize>,
     },
     FlowAvailable {
-        channel_key: usize,
+        channel_key: u64,
     },
     InputOverflow {
-        channel_key: usize,
+        channel_key: u64,
     },
     WithdrawService,
 }
@@ -37,8 +37,8 @@ pub(super) enum DispatchItem {
 
 pub(super) struct DispatchBuffer {
     items: VecDeque<DispatchItem>,
-    pending_flow: HashSet<usize>,
-    pending_overflow: HashSet<usize>,
+    pending_flow: HashSet<u64>,
+    pending_overflow: HashSet<u64>,
     accepts_commands: bool,
     active: bool,
 }

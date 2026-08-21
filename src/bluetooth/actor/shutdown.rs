@@ -96,18 +96,20 @@ impl BluetoothActor {
             return;
         }
 
-        let notification = {
+        let listener = {
             let mut state = self.ivars().state.borrow_mut();
             state.service_record = None;
-            state.incoming_notification.take()
+            state.incoming_listener.take()
         };
-        let Some(notification) = notification else {
+        let Some(listener) = listener else {
             self.emit_fatal("unregister missing RFCOMM listener", -1);
             return;
         };
-        // SAFETY: Service removal succeeded and the actor owns this live
-        // incoming-channel registration.
-        unsafe { notification.unregister() };
+        for notification in listener.into_notifications() {
+            // SAFETY: Service removal succeeded and the actor owns every live
+            // incoming-channel registration generation.
+            unsafe { notification.unregister() };
+        }
         let action = self
             .ivars()
             .state

@@ -12,7 +12,7 @@ use crate::bluetooth::types::{BtEvent, ConnectionId, DeviceAddress};
 impl BluetoothActor {
     pub(super) fn stage_delivered_channel(
         &self,
-        notification: &IOBluetoothUserNotification,
+        _notification: &IOBluetoothUserNotification,
         channel: &IOBluetoothRFCOMMChannel,
     ) {
         let channel = IOBluetoothRFCOMMChannel::retain(channel);
@@ -30,11 +30,6 @@ impl BluetoothActor {
             }
             let connection = state.next_connection;
             state.next_connection = connection.next();
-            let delivery_state = if state.incoming_notification.as_deref() == Some(notification) {
-                DeliveryState::Ready
-            } else {
-                DeliveryState::InvalidListener
-            };
             state.delivered.insert(
                 key,
                 DeliveredChannel {
@@ -42,7 +37,7 @@ impl BluetoothActor {
                     channel: channel.clone(),
                     close_notification: None,
                     delegate: DelegateState::Missing,
-                    state: delivery_state,
+                    state: DeliveryState::Ready,
                 },
             );
             connection
@@ -72,7 +67,7 @@ impl BluetoothActor {
         self.defer(NativeAction::OpenDelivered { channel_key: key });
     }
 
-    pub(super) fn open_delivered_channel(&self, key: usize) {
+    pub(super) fn open_delivered_channel(&self, key: u64) {
         let delivered = self.ivars().state.borrow_mut().delivered.remove(&key);
         let Some(delivered) = delivered else {
             return;
@@ -95,12 +90,8 @@ impl BluetoothActor {
             self.reject_delivered(delivered, true);
             return;
         }
-        if matches!(
-            delivered.state,
-            DeliveryState::InvalidListener | DeliveryState::InputOverflow
-        ) {
-            let fatal = delivered.state == DeliveryState::InvalidListener;
-            self.reject_delivered(delivered, fatal);
+        if delivered.state == DeliveryState::InputOverflow {
+            self.reject_delivered(delivered, false);
             return;
         }
 
@@ -220,10 +211,26 @@ impl BluetoothActor {
     }
 
     pub(super) fn accept_next(&self, after: ConnectionId) {
-        self.ivars().state.borrow_mut().acceptance.arm(after);
+        {
+            let mut state = self.ivars().state.borrow_mut();
+            if !state.acceptance.is_awaiting(after) {
+                return;
+            }
+            if state.incoming_listener.is_none() {
+                drop(state);
+                self.emit_fatal("renew missing RFCOMM listener notification", -1);
+                return;
+            }
+            if !state.acceptance.arm(after) {
+                drop(state);
+                self.emit_fatal("arm renewed RFCOMM listener", -1);
+                return;
+            }
+        }
+        self.refresh_incoming_listener();
     }
 
-    pub(super) fn channel_closed(&self, key: usize) {
+    pub(super) fn channel_closed(&self, key: u64) {
         let (notification, action) = {
             let mut state = self.ivars().state.borrow_mut();
             if let Some(delivered) = state.delivered.get_mut(&key) {
@@ -270,7 +277,7 @@ impl BluetoothActor {
         }
     }
 
-    pub(super) fn input_overflow(&self, key: usize) {
+    pub(super) fn input_overflow(&self, key: u64) {
         let connection = {
             let mut state = self.ivars().state.borrow_mut();
             if let Some(delivered) = state.delivered.get_mut(&key) {
@@ -335,7 +342,13 @@ impl BluetoothActor {
             })
     }
 
-    pub(super) fn channel_key(channel: &IOBluetoothRFCOMMChannel) -> usize {
-        std::ptr::from_ref(channel) as usize
+    pub(super) fn channel_key(channel: &IOBluetoothRFCOMMChannel) -> u64 {
+        // SAFETY: The callback or actor-owned Retained keeps the native
+        // channel alive for this metadata read. IOBluetooth may construct a
+        // distinct Objective-C wrapper for every matching user notification;
+        // getObjectID is the documented process-independent identity of the
+        // underlying RFCOMM channel, so all those wrappers must route to one
+        // lifecycle entry.
+        unsafe { channel.getObjectID() }
     }
 }

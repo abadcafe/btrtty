@@ -1,13 +1,14 @@
 mod input;
+mod output;
 mod pty;
 mod tx;
 
 use anyhow::{Context, Result, anyhow, bail};
-use tokio::io::AsyncReadExt;
 use tokio::sync::mpsc;
 use tokio_util::sync::CancellationToken;
 
 use crate::bluetooth::{BtCommand, BtError, BtEvent, BtInput, ConnectionId};
+use output::OutputReader;
 use tx::{Transmitter, TxWrite};
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -110,22 +111,23 @@ pub(crate) async fn run_session<S: BluetoothSink>(
         shutdown,
     } = request;
     let transmitter = Transmitter::new(mtu)?;
-    let mut process = pty::spawn(&config).context("spawn PTY session")?;
+    let process = pty::spawn(&config).context("spawn PTY session")?;
+    let pty::PtyProcess {
+        reader,
+        writer,
+        mut child,
+    } = process;
+    let mut reader = OutputReader::new(reader);
     let input_cancel = CancellationToken::new();
-    let mut input_task = tokio::spawn(input::pump(
-        input,
-        connection,
-        process.writer,
-        input_cancel.clone(),
-    ));
+    let mut input_task = tokio::spawn(input::pump(input, connection, writer, input_cancel.clone()));
     let mut early_input_join = None;
 
     let primary = {
         let mut bridge_state = Bridge {
             events,
             bluetooth: &bluetooth,
-            child: &mut process.child,
-            reader: &mut process.reader,
+            child: &mut child,
+            reader: &mut reader,
             shutdown: &shutdown,
             connection,
         };
@@ -150,7 +152,7 @@ pub(crate) async fn run_session<S: BluetoothSink>(
     let mut input_outcome = match input_join {
         Ok(outcome) => outcome,
         Err(error) => {
-            let cleanup = cleanup_child(&mut process.child).await;
+            let cleanup = cleanup_child(&mut child).await;
             return merge_join_failure(primary, &error, cleanup);
         }
     };
@@ -167,7 +169,7 @@ pub(crate) async fn run_session<S: BluetoothSink>(
     };
 
     let input_result = input_outcome.error.take().map_or(Ok(()), Err);
-    let cleanup_result = cleanup_child(&mut process.child).await;
+    let cleanup_result = cleanup_child(&mut child).await;
     while input_outcome.receiver.try_recv().is_ok() {}
 
     let end = merge_session_results(session_result, input_result, cleanup_result)?;
@@ -186,7 +188,7 @@ struct Bridge<'a, S> {
     events: &'a mut mpsc::UnboundedReceiver<BtEvent>,
     bluetooth: &'a S,
     child: &'a mut tokio::process::Child,
-    reader: &'a mut pty_process::OwnedReadPty,
+    reader: &'a mut OutputReader<pty_process::OwnedReadPty>,
     shutdown: &'a CancellationToken,
     connection: ConnectionId,
 }
@@ -218,7 +220,7 @@ impl<S: BluetoothSink> Bridge<'_, S> {
                     status.context("wait for PTY child")?;
                     child_exited = true;
                 }
-                output = self.reader.read(&mut read_buffer[..read_capacity]),
+                output = self.reader.read_batch(&mut read_buffer[..read_capacity]),
                     if !output_closed && read_capacity > 0 =>
                 {
                     let count = output.context("read PTY output")?;
@@ -340,6 +342,8 @@ fn merge_join_failure(
     bail!(errors.join("; "))
 }
 
+#[cfg(test)]
+mod output_tests;
 #[cfg(test)]
 mod scheduler_tests;
 #[cfg(test)]

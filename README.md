@@ -27,8 +27,8 @@ macOS main thread                 Tokio runtime（2 workers）
 - Tokio 命令经 `CFRunLoopSourceSignal` + `CFRunLoopWakeUp` 送回主线程，无轮询。
 - 每条连接都有不可复用的 `ConnectionId`；`Send`、`Close`、write completion、input 和 disconnect 全部带连接 ID。旧连接的延迟事件/命令不能命中新连接。首次 acceptance 在 listener publication 前已经 armed；之后只有上一条连接的真实 close callback 才能产生一次性的 reconnect permit。
 - RFCOMM 只使用 `writeAsync`，每次提交都不超过实际 MTU，同时最多保留 8 个尚未完成的 write。Bluetooth flow control 或该窗口满时停止继续提交。
-- PTY output 直接读入恰好一个 RFCOMM MTU 的 staging buffer，不存在限速器、发送 timer、固定合并 timer 或中间 chunk channel。空闲后的首个 partial packet 立即提交；它完成前，后续不足 MTU 的尾部字节留在 staging 中合并，完整 MTU packet 仍可流水发送。字节内容和顺序不变。
-- SDP record 和 incoming listener 与长期运行的 btrtty 进程同寿命；普通 client disconnect 只销毁本次 PTY/bash，绝不重新发布 Bluetooth 服务。
+- PTY output 直接读入恰好一个 RFCOMM MTU 的 staging buffer，不存在限速器、发送 timer、固定合并 timer 或中间 chunk channel。每批读取只等待首个 PTY fragment，随后在同一 Tokio 调度轮次内继续吸收已经 ready 的尾部，遇到 `Pending` 立即停止，不等待未来数据。空闲后的首个 partial packet 随即提交；它完成前，后续不足 MTU 的尾部字节留在 staging 中合并，完整 MTU packet 仍可流水发送。字节内容和顺序不变。
+- SDP record 与动态 RFCOMM channel 在长期运行的 btrtty 进程内保持不变，绝不因普通 client disconnect 重新发布。macOS 15 的 `bluetoothd` 会丢弃尚未匹配到请求的 RFCOMM accept session，即使公开 API 返回的 Objective-C notification 仍被持有；因此仅在 `Waiting` 状态，native main thread 使用 500ms `CFRunLoopTimer` 为同一 channel 注册新 generation。连接交付、拒绝关闭中或已有 active client 时 timer 休眠；最近 5 秒的 generation 保留到握手回调安全期结束后才注销。
 - 每个 active channel 都注册独立的 channel-close notification；actor 必须同时收到全部 outstanding write completions 和真实 channel-close callback，才会释放 channel 与 pending `Bytes`，这些事件无论以什么顺序到达都不能越过另一道屏障。超过单 active-client 限制的已打开 channel 也会被保留并等待真实 close callback，不会直接丢弃 Objective-C 对象。
 - 最终关闭顺序固定为：停止 PTY 和新 write → 等待全部 outstanding writes → 请求关闭已知 channel → 等待全部 channel-close callbacks → 删除 SDP record → 注销 incoming notification → 停止 CFRunLoop。不得提前报告 native shutdown 完成。
 - `closeChannel()` 提交失败时不会用设备级 ACL 关闭兜底，也不会假装 channel 已关闭；actor 保留所有权并继续等远端真实 close callback，完成资源清理后以错误状态退出。
@@ -94,7 +94,7 @@ dist/btrtty \
 
 Mac→Linux 不做应用层限速。PTY output staging 恰好容纳一个实际 RFCOMM MTU，outstanding command window 固定为 8。当前实机 MTU 为 667 时，应用层已读取但尚未完成的输出最多为 `9 × 667 = 6,003` 字节；超过边界后停止读取 PTY，由 kernel backpressure 阻塞输出源，不丢弃字节。
 
-发送端采用 event-driven tail coalescing：空闲后的第一批字节不等待；同一时刻最多有一个不足 MTU 的 write outstanding。这个 partial write 完成前，新尾部字节会在一个 MTU 的 staging 中自然合并，达到 MTU 时可以立即流水发送。它只改变 RFCOMM write 的分块边界，不改变 payload，也不按时间或字节速率限流。
+发送端采用 event-driven tail coalescing：PTY 首次可读后只合并当下已经 ready 的字节，不 sleep、不启动 timer；空闲后的第一批字节随即发送。同一时刻最多有一个不足 MTU 的 write outstanding。这个 partial write 完成前，新尾部字节会在一个 MTU 的 staging 中自然合并，达到 MTU 时可以立即流水发送。它只改变 RFCOMM write 的分块边界，不改变 payload，也不按时间或字节速率限流。
 
 默认值是 `exec /bin/bash -l`、24 行、80 列（即通常所说的 `80×24`）。每次客户端连接创建的新 PTY 都以当前用户的 `$HOME` 为初始工作目录；`$HOME` 缺失或无效时会话创建失败。正常启动会显示系统动态分配的 RFCOMM channel：
 
@@ -106,7 +106,7 @@ RFCOMM channel: 11
 Waiting for paired client...
 ```
 
-客户端断开时，btrtty 必须同时等到全部 outstanding write completions（若存在）和 IOBluetooth 的实际 channel-close callback，随后才销毁本次 PTY 并重新进入等待；SDP/listener 全程不动。SIGINT/SIGTERM 也必须跨过这两道屏障，之后才依次删除 SDP、注销 listener 并退出。
+客户端断开时，btrtty 必须同时等到全部 outstanding write completions（若存在）和 IOBluetooth 的实际 channel-close callback，随后销毁本次 PTY、开放下一次 acceptance，并立即为同一 RFCOMM channel 注册新的 incoming-notification generation；若请求尚未来到，Waiting-only native timer 继续续发 generation。SDP record 全程不动。SIGINT/SIGTERM 也必须跨过前述两道屏障，之后才依次删除 SDP、注销全部仍保留的 listener generation 并退出。
 
 ### 长期运行与退出契约
 
@@ -146,7 +146,9 @@ sudo rfcomm -r connect /dev/rfcomm0 MAC_BT_ADDRESS 11
 picocom -b 115200 --flow n /dev/rfcomm0
 ```
 
-`-r` 必须位于 `connect` 前面。它让 BlueZ 在创建 RFCOMM TTY 后立即切换到 raw mode，避免 picocom 打开设备前，Linux TTY 的默认 canonical/echo line discipline 把 Mac 的初始 prompt 回送给 Mac shell，形成输出回声环。这里的 `115200` 只是 serial client 需要的名义波特率，不控制 Bluetooth 吞吐。退出后可释放设备：
+`-r` 必须位于 `connect` 前面。它让 BlueZ 在创建 RFCOMM TTY 后立即切换到 raw mode，避免 picocom 打开设备前，Linux TTY 的默认 canonical/echo line discipline 把 Mac 的初始 prompt 回送给 Mac shell，形成输出回声环。这里的 `115200` 只是 serial client 需要的名义波特率，不控制 Bluetooth 吞吐。
+
+picocom 中的普通 Ctrl-C 是发给 Mac PTY 的字节 `0x03`，不会断开 Bluetooth。需要主动断开时，先用 picocom 的退出键关闭 serial client，再在运行 `rfcomm connect` 的终端按 Ctrl-C；`rfcomm` 创建的 TTY 使用 `RELEASE_ONHUP`，只有最后一个打开 `/dev/rfcomm0` 的进程退出后 Linux 才会真正释放它。必要时可显式释放：
 
 ```bash
 sudo rfcomm release /dev/rfcomm0
