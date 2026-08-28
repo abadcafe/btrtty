@@ -192,13 +192,14 @@ impl Dispatcher {
         Ok(())
     }
 
-    pub(super) fn deactivate(&self) -> Result<()> {
+    pub(super) fn deactivate(&self) {
         let mut state = self
             .state
             .lock()
-            .map_err(|_| anyhow::anyhow!("Bluetooth dispatch queue mutex poisoned"))?;
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
         state.buffer.deactivate();
-        Ok(())
+        state.source_address = 0;
+        state.run_loop_address = 0;
     }
 }
 

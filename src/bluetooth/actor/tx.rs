@@ -5,8 +5,8 @@ use objc2::DefinedClass;
 use objc2_io_bluetooth::IOBluetoothRFCOMMChannel;
 
 use super::BluetoothActor;
-use super::state::PendingWrite;
-use crate::bluetooth::types::{BtEvent, ConnectionId, MAX_RFCOMM_WRITE_COMMANDS, WriteToken};
+use super::write_ledger::{AdmittedWrite, Completion, PendingWrite};
+use crate::bluetooth::types::{BtEvent, ConnectionId, WriteToken};
 
 impl BluetoothActor {
     pub(super) fn send(&self, connection: ConnectionId, token: WriteToken, data: Bytes) {
@@ -16,11 +16,6 @@ impl BluetoothActor {
                 return;
             };
             if active.connection != connection {
-                return;
-            }
-            if state.queued_writes.len() + state.pending_writes.len() >= MAX_RFCOMM_WRITE_COMMANDS {
-                drop(state);
-                self.emit_fatal("RFCOMM write command exceeded its bounded window", -1);
                 return;
             }
             active.channel.clone()
@@ -33,21 +28,24 @@ impl BluetoothActor {
             self.begin_session_close(connection);
             return;
         }
-        let write = PendingWrite {
-            connection,
-            token,
-            data,
+
+        let admitted = self
+            .ivars()
+            .state
+            .borrow_mut()
+            .writes
+            .admit(PendingWrite::new(connection, token, data));
+        let Ok(admitted) = admitted else {
+            self.emit_fatal("admit RFCOMM write token", -1);
+            return;
         };
+
         // SAFETY: This is a non-blocking flow-state query on the main thread.
         if unsafe { channel.isTransmissionPaused() } {
-            self.ivars()
-                .state
-                .borrow_mut()
-                .queued_writes
-                .push_back(write);
+            self.ivars().state.borrow_mut().writes.queue(admitted);
             return;
         }
-        self.submit_write(&channel, write);
+        self.submit_write(&channel, admitted);
     }
 
     pub(super) fn flow_available(&self, key: u64) {
@@ -61,61 +59,62 @@ impl BluetoothActor {
                     return;
                 }
                 let channel = active.channel.clone();
-                let Some(write) = state.queued_writes.pop_front() else {
+                let Some(write) = state.writes.pop_queued() else {
                     return;
                 };
                 (channel, write)
             };
             // SAFETY: This is a non-blocking flow-state query on the main thread.
             if unsafe { channel.isTransmissionPaused() } {
-                self.ivars()
-                    .state
-                    .borrow_mut()
-                    .queued_writes
-                    .push_front(write);
+                self.ivars().state.borrow_mut().writes.push_front(write);
                 return;
             }
             self.submit_write(&channel, write);
         }
     }
 
-    fn submit_write(&self, channel: &IOBluetoothRFCOMMChannel, write: PendingWrite) {
-        let Ok(refcon) = usize::try_from(write.token.get()) else {
+    fn submit_write(&self, channel: &IOBluetoothRFCOMMChannel, write: AdmittedWrite) {
+        let connection = write.connection();
+        let Ok(refcon) = usize::try_from(write.token().get()) else {
             self.emit_fatal("encode RFCOMM write token", -1);
             return;
         };
-        let connection = write.connection;
-        let token = write.token;
-        let pointer = write.data.as_ptr().cast_mut().cast::<c_void>();
-        let length = u16::try_from(write.data.len()).expect("write length was validated");
-        {
+        let native = {
             let mut state = self.ivars().state.borrow_mut();
             if state.lifecycle.write_started().is_err() {
                 drop(state);
                 self.emit_connection_error(connection, "write on closing RFCOMM channel", -1);
                 return;
             }
-            state.pending_writes.insert(token, write);
-        }
+            state.writes.start(write)
+        };
 
-        // SAFETY: The pointer addresses Bytes retained until the matching
-        // completion action. The write size is non-zero and no larger than MTU.
-        let status =
-            unsafe { channel.writeAsync_length_refcon(pointer, length, refcon as *mut c_void) };
+        // SAFETY: `NativeWrite` points into Bytes now retained by WriteLedger
+        // until the matching completion or synchronous submission failure.
+        let status = unsafe {
+            channel.writeAsync_length_refcon(
+                native.pointer(),
+                native.length(),
+                refcon as *mut c_void,
+            )
+        };
         if status != 0 {
             let action = {
                 let mut state = self.ivars().state.borrow_mut();
-                state.pending_writes.remove(&token);
-                state.retired_writes.insert(token);
+                if state.writes.fail(native.token()).is_none() {
+                    drop(state);
+                    self.emit_fatal("roll back missing RFCOMM write", -1);
+                    return;
+                }
                 state.lifecycle.write_completed()
             };
-            self.emit_connection_error(connection, "submit RFCOMM async write", status);
+            self.emit_connection_error(native.connection(), "submit RFCOMM async write", status);
             if let Ok(action) = action {
                 self.apply_lifecycle_action(action);
             } else {
                 self.emit_fatal("roll back RFCOMM write submission", -1);
             }
-            self.begin_session_close(connection);
+            self.begin_session_close(native.connection());
         }
     }
 
@@ -143,44 +142,48 @@ impl BluetoothActor {
             if !active_matches {
                 return;
             }
-            let pending = state.pending_writes.remove(&token);
-            if pending.is_none() && state.retired_writes.contains(&token) {
-                return;
+            match state.writes.complete(token) {
+                Completion::Current(pending) => {
+                    let action = state.lifecycle.write_completed();
+                    (pending, action)
+                }
+                Completion::Retired => return,
+                Completion::Queued => {
+                    drop(state);
+                    self.emit_fatal("complete queued RFCOMM write", -1);
+                    return;
+                }
+                Completion::Unknown => {
+                    drop(state);
+                    self.emit_fatal("complete unknown RFCOMM write", -1);
+                    return;
+                }
             }
-            if pending.is_some() {
-                state.retired_writes.insert(token);
-            }
-            let action = pending.as_ref().map(|_| state.lifecycle.write_completed());
-            (pending, action)
-        };
-        let Some(pending) = pending else {
-            self.emit_fatal("complete unknown RFCOMM write", -1);
-            return;
         };
         let bytes_written =
-            actual.unwrap_or_else(|| if status == 0 { pending.data.len() } else { 0 });
-        let successful = status == 0 && bytes_written == pending.data.len();
+            actual.unwrap_or_else(|| if status == 0 { pending.data().len() } else { 0 });
+        let successful = status == 0 && bytes_written == pending.data().len();
         if successful {
             let _ = self.ivars().events.send(BtEvent::WriteComplete {
-                connection: pending.connection,
-                token: pending.token,
+                connection: pending.connection(),
+                token: pending.token(),
                 bytes_written,
                 status,
             });
         } else {
             let error_status = if status == 0 { -1 } else { status };
             self.emit_connection_error(
-                pending.connection,
+                pending.connection(),
                 "complete RFCOMM async write",
                 error_status,
             );
         }
-        match action.expect("pending write has a lifecycle transition") {
+        match action {
             Ok(action) => self.apply_lifecycle_action(action),
             Err(_) => self.emit_fatal("complete RFCOMM write lifecycle", -1),
         }
         if !successful {
-            self.begin_session_close(pending.connection);
+            self.begin_session_close(pending.connection());
         }
     }
 }

@@ -6,7 +6,7 @@ use objc2::MainThreadMarker;
 use objc2::rc::{Retained as ObjcRetained, autoreleasepool};
 use objc2_core_foundation::{
     CFAbsoluteTimeGetCurrent, CFRetained, CFRunLoop, CFRunLoopSource, CFRunLoopSourceContext,
-    CFRunLoopTimer, CFRunLoopTimerContext, kCFRunLoopCommonModes,
+    CFRunLoopTimer, CFRunLoopTimerContext,
 };
 use objc2_io_bluetooth::IOBluetoothHostController;
 use tokio::sync::mpsc;
@@ -14,6 +14,12 @@ use tokio::sync::mpsc;
 use super::actor::BluetoothActor;
 use super::dispatch::{DispatchItem, Dispatcher, MainThreadCommandQueue};
 use super::types::{BtCommand, BtEvent, BtInput, DeviceAddress};
+
+mod callbacks;
+#[cfg(test)]
+mod callbacks_tests;
+
+use callbacks::RunLoopCallbacks;
 
 struct SourceContext {
     actor: ObjcRetained<BluetoothActor>,
@@ -38,8 +44,7 @@ impl SourceContext {
 }
 
 pub struct BluetoothMainThread {
-    source: CFRetained<CFRunLoopSource>,
-    run_loop: CFRetained<CFRunLoop>,
+    callbacks: RunLoopCallbacks,
     context: Box<SourceContext>,
     queue: MainThreadCommandQueue,
     local_address: DeviceAddress,
@@ -114,14 +119,13 @@ impl BluetoothMainThread {
             )
         }
         .context("create RFCOMM listener refresh timer")?;
-        context.listener_timer = Some(listener_timer);
+        context.listener_timer = Some(listener_timer.clone());
         let run_loop = CFRunLoop::main().context("obtain macOS main CFRunLoop")?;
-        // SAFETY: This process is running on macOS and Core Foundation exports
-        // the standard common-modes constant for the lifetime of the process.
-        let common_modes =
-            unsafe { kCFRunLoopCommonModes }.context("obtain kCFRunLoopCommonModes")?;
+        let mut callbacks = RunLoopCallbacks::new(source, listener_timer, run_loop)?;
 
-        context.dispatcher.install(&source, &run_loop)?;
+        context
+            .dispatcher
+            .install(callbacks.source(), callbacks.run_loop())?;
 
         // Publication is the final fallible startup operation. The command
         // source and its stable context already exist, but the source is not
@@ -131,14 +135,12 @@ impl BluetoothMainThread {
             .actor
             .publish()
             .context("publish Bluetooth SPP service")?;
-        run_loop.add_source(Some(&source), Some(common_modes));
-        run_loop.add_timer(context.listener_timer.as_deref(), Some(common_modes));
+        callbacks.activate();
         context.schedule_listener_timer();
 
         let queue = context.dispatcher.command_queue();
         Ok(Self {
-            source,
-            run_loop,
+            callbacks,
             context,
             queue,
             local_address,
@@ -180,21 +182,18 @@ impl BluetoothMainThread {
     }
 
     fn teardown(&mut self) -> Result<()> {
-        if let Some(timer) = self.context.listener_timer.take() {
-            // SAFETY: Same process-lifetime constant used when adding the timer.
-            if let Some(common_modes) = unsafe { kCFRunLoopCommonModes } {
-                self.run_loop.remove_timer(Some(&timer), Some(common_modes));
-            }
-            timer.invalidate();
-        }
-        self.context.dispatcher.deactivate()?;
-        // SAFETY: Same process-lifetime constant used when adding the source.
-        if let Some(common_modes) = unsafe { kCFRunLoopCommonModes } {
-            self.run_loop
-                .remove_source(Some(&self.source), Some(common_modes));
-        }
-        self.source.invalidate();
+        self.context.dispatcher.deactivate();
+        self.callbacks.detach();
+        self.context.listener_timer = None;
         self.context.actor.finish()
+    }
+}
+
+impl Drop for BluetoothMainThread {
+    fn drop(&mut self) {
+        self.context.dispatcher.deactivate();
+        self.callbacks.detach();
+        self.context.listener_timer = None;
     }
 }
 

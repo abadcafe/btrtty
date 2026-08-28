@@ -1,22 +1,16 @@
-use std::collections::{HashMap, VecDeque};
+use std::collections::HashMap;
 
-use bytes::Bytes;
 use objc2::rc::Retained;
 use objc2_io_bluetooth::{
     IOBluetoothRFCOMMChannel, IOBluetoothSDPServiceRecord, IOBluetoothUserNotification,
 };
 
 use crate::bluetooth::lifecycle::Lifecycle;
-use crate::bluetooth::types::{BtError, ConnectionId, WriteToken};
+use crate::bluetooth::types::{BtError, ConnectionId};
 
 use super::acceptance::AcceptanceGate;
 use super::listener::IncomingListener;
-
-pub(super) struct PendingWrite {
-    pub(super) connection: ConnectionId,
-    pub(super) token: WriteToken,
-    pub(super) data: Bytes,
-}
+use super::write_ledger::WriteLedger;
 
 pub(super) struct ActiveChannel {
     pub(super) connection: ConnectionId,
@@ -64,9 +58,7 @@ pub(super) struct ActorState {
     pub(super) delivered: HashMap<u64, DeliveredChannel>,
     pub(super) active: Option<ActiveChannel>,
     pub(super) rejected: HashMap<u64, RejectedChannel>,
-    pub(super) queued_writes: VecDeque<PendingWrite>,
-    pub(super) pending_writes: HashMap<WriteToken, PendingWrite>,
-    pub(super) retired_writes: std::collections::HashSet<WriteToken>,
+    pub(super) writes: WriteLedger,
     pub(super) lifecycle: Lifecycle,
     pub(super) next_connection: ConnectionId,
     pub(super) acceptance: AcceptanceGate,
@@ -81,9 +73,7 @@ impl Default for ActorState {
             delivered: HashMap::new(),
             active: None,
             rejected: HashMap::new(),
-            queued_writes: VecDeque::new(),
-            pending_writes: HashMap::new(),
-            retired_writes: std::collections::HashSet::new(),
+            writes: WriteLedger::new(),
             lifecycle: Lifecycle::new(),
             next_connection: ConnectionId::new(1).expect("one is a non-zero connection ID"),
             acceptance: AcceptanceGate::new(),

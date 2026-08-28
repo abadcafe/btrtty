@@ -100,14 +100,6 @@ impl WriteToken {
     pub const fn get(self) -> u64 {
         self.0.get()
     }
-
-    #[must_use]
-    pub const fn next(self) -> Self {
-        match Self::new(self.get().wrapping_add(1)) {
-            Some(next) => next,
-            None => Self(NonZeroU64::MIN),
-        }
-    }
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]

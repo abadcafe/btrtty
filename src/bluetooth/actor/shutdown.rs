@@ -12,7 +12,7 @@ impl BluetoothActor {
         let action = {
             let mut state = self.ivars().state.borrow_mut();
             state.acceptance.stop();
-            state.queued_writes.clear();
+            state.writes.clear_queued();
             if let Some(active) = state.active.as_mut() {
                 active.input = InputState::Closed;
             }
@@ -38,11 +38,11 @@ impl BluetoothActor {
                 Err(error) => self.emit_fatal(error, -1),
             },
             LifecycleAction::WithdrawService => {
-                if self.ivars().state.borrow().active.is_some()
-                    && let Err(error) = self.release_closed_active()
-                {
-                    self.emit_fatal(error, -1);
-                    return;
+                if self.ivars().state.borrow().active.is_some() {
+                    if let Err(error) = self.release_closed_active() {
+                        self.emit_fatal(error, -1);
+                        return;
+                    }
                 }
                 self.defer(NativeAction::WithdrawService);
             }
@@ -53,7 +53,7 @@ impl BluetoothActor {
     fn submit_channel_close(&self) {
         let channel = {
             let state = self.ivars().state.borrow();
-            if !state.queued_writes.is_empty() || !state.pending_writes.is_empty() {
+            if !state.writes.is_empty() {
                 drop(state);
                 self.emit_fatal("close RFCOMM channel with write outstanding", -1);
                 return;
@@ -130,13 +130,12 @@ impl BluetoothActor {
         if !active.close_observed {
             return Err("release RFCOMM channel before close callback");
         }
-        if !state.queued_writes.is_empty() || !state.pending_writes.is_empty() {
+        if !state.writes.is_empty() {
             return Err("release RFCOMM channel before write completion");
         }
         let connection = active.connection;
         state.acceptance.connection_closed(connection)?;
         state.active = None;
-        state.retired_writes.clear();
         Ok(connection)
     }
 

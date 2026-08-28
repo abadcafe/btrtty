@@ -1,4 +1,7 @@
+use std::ffi::c_void;
+
 use bytes::Bytes;
+use objc2_core_foundation::{CFRunLoop, CFRunLoopSource, CFRunLoopSourceContext};
 
 use super::dispatch::{DispatchBuffer, DispatchItem, Dispatcher, NativeAction};
 use super::types::{BtCommand, ConnectionId, WriteToken};
@@ -117,3 +120,35 @@ fn test_failed_uninstalled_submission_does_not_enqueue_command() {
     );
     assert!(dispatcher.drain().unwrap().is_empty());
 }
+
+#[test]
+fn test_dispatcher_deactivation_revokes_an_installed_wake_target() {
+    let dispatcher = Dispatcher::new();
+    let command_queue = dispatcher.command_queue();
+    let mut context = CFRunLoopSourceContext {
+        version: 0,
+        info: std::ptr::null_mut(),
+        retain: None,
+        release: None,
+        copyDescription: None,
+        equal: None,
+        hash: None,
+        schedule: None,
+        cancel: None,
+        perform: Some(noop_source),
+    };
+    // SAFETY: The initialized source context has a callback that ignores its
+    // null info pointer.
+    let source = unsafe { CFRunLoopSource::new(None, 0, &raw mut context) }.unwrap();
+    let run_loop = CFRunLoop::current().unwrap();
+    dispatcher.install(&source, &run_loop).unwrap();
+
+    command_queue.submit(BtCommand::Shutdown).unwrap();
+    assert_eq!(dispatcher.drain().unwrap().len(), 1);
+    dispatcher.deactivate();
+
+    assert!(command_queue.submit(BtCommand::Shutdown).is_err());
+    assert!(dispatcher.drain().unwrap().is_empty());
+}
+
+unsafe extern "C-unwind" fn noop_source(_info: *mut c_void) {}

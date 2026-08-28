@@ -21,6 +21,7 @@ struct Generation<T> {
 pub(super) struct IncomingListener<T = Retained<IOBluetoothUserNotification>> {
     channel_id: u8,
     generations: VecDeque<Generation<T>>,
+    retired_channel: Option<u64>,
 }
 
 impl<T> IncomingListener<T> {
@@ -31,11 +32,31 @@ impl<T> IncomingListener<T> {
                 registered_at,
                 notification,
             }]),
+            retired_channel: None,
         }
     }
 
-    pub(super) const fn channel_id(&self) -> u8 {
+    /// Start a fresh native registration epoch. Clearing the retirement fence
+    /// before calling `IOBluetooth` permits a synchronously delivered pending
+    /// connection to use the same native object ID in the new epoch.
+    pub(super) fn begin_registration(&mut self) -> u8 {
+        self.retired_channel = None;
         self.channel_id
+    }
+
+    pub(super) fn accepts_channel(&self, channel_key: u64) -> bool {
+        self.retired_channel != Some(channel_key)
+    }
+
+    /// Stop every matching incoming notification while one client owns the
+    /// server. The retired channel key fences callbacks from those generations
+    /// until `begin_registration` starts a genuinely new listener epoch.
+    pub(super) fn suspend_for_channel(&mut self, channel_key: u64) -> Vec<T> {
+        self.retired_channel = Some(channel_key);
+        self.generations
+            .drain(..)
+            .map(|generation| generation.notification)
+            .collect()
     }
 
     /// Install a fresh native accept generation and return generations whose

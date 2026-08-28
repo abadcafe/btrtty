@@ -17,9 +17,19 @@ impl BluetoothActor {
     ) {
         let channel = IOBluetoothRFCOMMChannel::retain(channel);
         let key = Self::channel_key(&channel);
+        // SAFETY: The incoming callback retains the channel for this immutable
+        // main-thread state query. A callback for an already-closed channel is
+        // stale and must never create lifecycle state.
+        if !unsafe { channel.isOpen() } {
+            return;
+        }
         let connection = {
             let mut state = self.ivars().state.borrow_mut();
-            if state.delivered.contains_key(&key)
+            if !state
+                .incoming_listener
+                .as_ref()
+                .is_some_and(|listener| listener.accepts_channel(key))
+                || state.delivered.contains_key(&key)
                 || state
                     .active
                     .as_ref()
@@ -63,6 +73,13 @@ impl BluetoothActor {
                 DelegateState::Missing
             };
             debug_assert_eq!(delivered.connection, connection);
+        }
+        // A remote close can race the first state check and notification setup.
+        // Synthesize the same deferred close action so OpenDelivered always sees
+        // Closed even if the native close callback happened before registration.
+        // SAFETY: The actor still retains the channel on its required thread.
+        if !unsafe { channel.isOpen() } {
+            self.defer(NativeAction::ChannelClosed { channel_key: key });
         }
         self.defer(NativeAction::OpenDelivered { channel_key: key });
     }
@@ -110,6 +127,7 @@ impl BluetoothActor {
             let state = self.ivars().state.borrow();
             state.acceptance.is_armed()
                 && state.active.is_none()
+                && state.incoming_listener.is_some()
                 && delivered.delegate == DelegateState::Installed
         };
         let Some(device) = device else {
@@ -143,8 +161,13 @@ impl BluetoothActor {
             close_notification,
             ..
         } = delivered;
-        {
+        let notifications = {
             let mut state = self.ivars().state.borrow_mut();
+            let notifications = state
+                .incoming_listener
+                .as_mut()
+                .expect("accepted channel requires a live incoming listener")
+                .suspend_for_channel(key);
             state.active = Some(ActiveChannel {
                 connection,
                 channel,
@@ -152,6 +175,14 @@ impl BluetoothActor {
                 close_observed: false,
                 input: InputState::Open,
             });
+            notifications
+        };
+
+        for notification in notifications {
+            // SAFETY: The accepted channel is now retained as active. Removing
+            // every incoming generation prevents any later callback for this
+            // listener epoch from reviving the channel after retirement.
+            unsafe { notification.unregister() };
         }
 
         if self
@@ -252,7 +283,7 @@ impl BluetoothActor {
                     active.close_observed = true;
                     active.close_notification.take()
                 };
-                state.queued_writes.clear();
+                state.writes.clear_queued();
                 (notification, Some(state.lifecycle.channel_closed()))
             } else if let Some(rejected) = state.rejected.remove(&key) {
                 (
@@ -311,7 +342,7 @@ impl BluetoothActor {
                 return;
             }
             active.input = InputState::Closed;
-            state.queued_writes.clear();
+            state.writes.clear_queued();
             state.lifecycle.begin_session_close()
         };
         match action {

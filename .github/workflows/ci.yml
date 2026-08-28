@@ -5,6 +5,13 @@ on:
   pull_request:
 
 jobs:
+  msrv:
+    runs-on: macos-14
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@1.85.0
+      - run: cargo check --locked --all-targets --all-features
+
   test:
     runs-on: macos-14
     steps:

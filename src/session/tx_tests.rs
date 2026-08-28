@@ -1,5 +1,5 @@
 use super::tx::Transmitter;
-use crate::bluetooth::MAX_RFCOMM_WRITE_COMMANDS;
+use crate::bluetooth::{MAX_RFCOMM_WRITE_COMMANDS, WriteToken};
 
 #[test]
 fn test_transmitter_rejects_invalid_mtu() {
@@ -157,7 +157,10 @@ fn test_transmitter_rejects_invalid_completion() {
 
     assert!(
         transmitter
-            .complete(write.token.next(), write.data.len())
+            .complete(
+                WriteToken::new(write.token.get() + 1).unwrap(),
+                write.data.len(),
+            )
             .is_err()
     );
     assert!(

@@ -30,6 +30,9 @@ mod listener_tests;
 mod shutdown;
 mod state;
 mod tx;
+mod write_ledger;
+#[cfg(test)]
+mod write_ledger_tests;
 
 use listener::IncomingListener;
 use state::ActorState;
@@ -282,16 +285,16 @@ impl BluetoothActor {
     /// registration while waiting lets the next generation consume an
     /// incoming request that bluetoothd has parked in the meantime.
     pub(super) fn refresh_incoming_listener(&self) {
+        if !self.listener_refresh_due() {
+            return;
+        }
         let channel_id = {
-            let state = self.ivars().state.borrow();
-            if !self.listener_refresh_due() {
-                return;
-            }
+            let mut state = self.ivars().state.borrow_mut();
             state
                 .incoming_listener
-                .as_ref()
+                .as_mut()
                 .expect("listener refresh eligibility was checked")
-                .channel_id()
+                .begin_registration()
         };
 
         let Some(notification) = self.register_incoming_notification(channel_id) else {
@@ -380,10 +383,7 @@ impl BluetoothActor {
         if !state.rejected.is_empty() {
             bail!("Bluetooth shutdown ended with rejected RFCOMM channels still closing");
         }
-        if !state.queued_writes.is_empty()
-            || !state.pending_writes.is_empty()
-            || !state.retired_writes.is_empty()
-        {
+        if !state.writes.is_empty() {
             bail!("Bluetooth shutdown ended with RFCOMM writes outstanding");
         }
         if !state.acceptance.is_stopped() {
