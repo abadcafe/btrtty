@@ -9,11 +9,10 @@
 ```bash
 cargo test --all-targets
 cargo clippy --all-targets --all-features -- -D warnings
-cargo +1.85.0 check --locked --all-targets --all-features
 ./scripts/package.sh
 ```
 
-- 89 项模块/单元测试与 2 项二进制元数据测试通过；声明的 Rust 1.85 MSRV 完成 locked all-target check。
+- 89 项模块/单元测试与 2 项二进制元数据测试通过；构建、测试、Clippy 和打包仅验证当前 Rust stable，不声明旧编译器 MSRV。
 - 单文件 Mach-O 内嵌稳定 `CFBundleIdentifier` 和 `NSBluetoothAlwaysUsageDescription`，无 App Bundle。
 - RFCOMM 与 PTY 之间没有握手、控制帧或 payload 转换。
 - PTY 往返保持 UTF-8、NUL、ESC/方向键序列原始字节。

@@ -38,11 +38,11 @@ impl BluetoothActor {
                 Err(error) => self.emit_fatal(error, -1),
             },
             LifecycleAction::WithdrawService => {
-                if self.ivars().state.borrow().active.is_some() {
-                    if let Err(error) = self.release_closed_active() {
-                        self.emit_fatal(error, -1);
-                        return;
-                    }
+                if self.ivars().state.borrow().active.is_some()
+                    && let Err(error) = self.release_closed_active()
+                {
+                    self.emit_fatal(error, -1);
+                    return;
                 }
                 self.defer(NativeAction::WithdrawService);
             }

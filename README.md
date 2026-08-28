@@ -43,7 +43,7 @@ macOS main thread                 Tokio runtime（2 workers）
 
 ## 构建
 
-需要 macOS、Command Line Tools/Xcode 和 Rust 1.85 或更新版本。CI 会分别使用声明的 1.85 MSRV 做 locked all-target check，并使用 stable 执行测试、Clippy 和打包：
+需要 macOS、Command Line Tools/Xcode 和当前 Rust stable。项目不声明或维护旧编译器 MSRV；`rust-toolchain.toml`、本地构建和 CI 均只使用 stable：
 
 ```bash
 cargo build --release

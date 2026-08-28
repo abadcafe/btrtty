@@ -27,7 +27,7 @@ struct SourceContext {
     listener_timer: Option<CFRetained<CFRunLoopTimer>>,
 }
 
-const LISTENER_DORMANT_INTERVAL: Duration = Duration::from_secs(24 * 60 * 60);
+const LISTENER_DORMANT_INTERVAL: Duration = Duration::from_hours(24);
 
 impl SourceContext {
     fn schedule_listener_timer(&self) {
