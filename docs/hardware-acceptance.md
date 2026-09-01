@@ -12,15 +12,15 @@ cargo clippy --all-targets --all-features -- -D warnings
 ./scripts/package.sh
 ```
 
-- 89 项模块/单元测试与 2 项二进制元数据测试通过；构建、测试、Clippy 和打包仅验证当前 Rust stable，不声明旧编译器 MSRV。
+- 88 项模块/单元测试与 2 项二进制元数据测试通过；构建、测试、Clippy 和打包仅验证当前 Rust stable，不声明旧编译器 MSRV。
 - 单文件 Mach-O 内嵌稳定 `CFBundleIdentifier` 和 `NSBluetoothAlwaysUsageDescription`，无 App Bundle。
 - RFCOMM 与 PTY 之间没有握手、控制帧或 payload 转换。
 - PTY 往返保持 UTF-8、NUL、ESC/方向键序列原始字节。
 - `0x03` 由 PTY line discipline 作为 Ctrl-C 交给 foreground process group。
 - `--rows/--cols` 指定的尺寸已经通过 `stty size` 集成测试验证。
 - PTY 设置 `TERM=xterm-256color`、`COLORTERM=truecolor`，不安装自定义终端描述。
-- PTY output 没有限速器、发送 timer、固定延时合并器或中间 chunk channel；每批只等待首个 PTY fragment，随后只吸收同一调度轮次中已经 ready 的尾部，遇到 `Pending` 立即返回。空闲后的首个 partial packet 随即提交，后续 partial 尾部在上一 partial completion 前自然合并，完整 MTU packet 仍可流水提交。
-- outstanding RFCOMM command window 固定为 8；同一时刻最多一个 partial write outstanding；buffer 所有权保持到对应 completion，支持 completion 乱序到达。
+- PTY output 没有限速器、发送 timer、固定延时合并器或中间 chunk channel；每批只等待首个 PTY fragment，随后只吸收同一调度轮次中已经 ready 的尾部，遇到 `Pending` 立即返回。得到的批次无论是否填满 MTU，只要 write window 未满就立即提交。
+- outstanding RFCOMM command window 固定为 8；full 与 partial write 使用完全相同的窗口，任何 partial completion 都不会阻塞后续 write；buffer 所有权保持到对应 completion，支持 completion 乱序到达。
 - 所有 data、write completion、close 和 command 均由不可复用的 `ConnectionId` 隔离；旧连接事件不能命中新连接。首次 acceptance 在 listener publication 前 armed，reconnect permit 只能消费一次。macOS 15 的 daemon-side idle accept 丢失由 native main-thread `CFRunLoopTimer` 处理：只在 Waiting 状态每 500ms 为同一 channel 注册一个公开 incoming-notification generation，waiting 时 generation 保留 5 秒 callback grace。接受连接时封存 channel identity 并注销当前 epoch 的全部 generation；只有真实 close 后才开放新 epoch，已关闭 channel 的延迟重复 open callback 不能复活连接状态。
 - RFCOMM write ledger 在 native submission 前拒绝重复或非单调 token，queued/pending buffer 不可被替换；已完成 token 用单一 high-water mark 判定，不积累无界 tombstone 集合。10,000 次连续完成与乱序 completion 已覆盖。
 - `CFRunLoopSource` 与 listener timer 使用统一 RAII guard；drop、unwind 和正常 teardown 均在销毁 boxed callback context 前 invalidate/remove 两个 callback 注册。
@@ -109,6 +109,7 @@ picocom -b 115200 --flow n /dev/rfcomm0
 - [ ] `yes` 大量输出时 RSS 稳定在有界范围，停止后能恢复交互。
 - [ ] 长时间持续输出后 write-completion 追踪内存保持常量级；重复 write token 在任何 native `writeAsync` 提交之前被拒绝，原 pending buffer 保持有效。
 - [ ] 空闲后的首批字节无需等待应用层 timer；连续输出由 RFCOMM/native flow control 以链路可用速度发送。
+- [ ] 人为延迟第一个 partial write completion 时，后续 partial write 仍连续提交直至占满全部 8 个 window slot；第 9 批保留在单 MTU staging 中，不发生队头阻塞或无界读取。
 - [ ] 大量输出时，应用层已读取但尚未完成的输出不超过 9 个实际 MTU，PTY/kernel backpressure 生效且不丢字符。
 - [ ] Vim/nvim/codex 连续刷新时保持可交互，不出现持续的光标重影、刷新积压或明显卡顿。
 - [ ] 长时间空闲后输入第一个字符，不会由应用层固定延时引入额外停顿；若仍有无线链路唤醒延迟，单独记录 controller mode-change 日志。

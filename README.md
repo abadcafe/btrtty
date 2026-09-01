@@ -27,7 +27,7 @@ macOS main thread                 Tokio runtime（2 workers）
 - Tokio 命令经 `CFRunLoopSourceSignal` + `CFRunLoopWakeUp` 送回主线程，无轮询。
 - 每条连接都有不可复用的 `ConnectionId`；`Send`、`Close`、write completion、input 和 disconnect 全部带连接 ID。旧连接的延迟事件/命令不能命中新连接。首次 acceptance 在 listener publication 前已经 armed；之后只有上一条连接的真实 close callback 才能产生一次性的 reconnect permit。
 - RFCOMM 只使用 `writeAsync`，每次提交都不超过实际 MTU，同时最多保留 8 个尚未完成的 write。Bluetooth flow control 或该窗口满时停止继续提交。
-- PTY output 直接读入恰好一个 RFCOMM MTU 的 staging buffer，不存在限速器、发送 timer、固定合并 timer 或中间 chunk channel。每批读取只等待首个 PTY fragment，随后在同一 Tokio 调度轮次内继续吸收已经 ready 的尾部，遇到 `Pending` 立即停止，不等待未来数据。空闲后的首个 partial packet 随即提交；它完成前，后续不足 MTU 的尾部字节留在 staging 中合并，完整 MTU packet 仍可流水发送。字节内容和顺序不变。
+- PTY output 直接读入恰好一个 RFCOMM MTU 的 staging buffer，不存在限速器、发送 timer、固定合并 timer 或中间 chunk channel。每批读取只等待首个 PTY fragment，随后在同一 Tokio 调度轮次内继续吸收已经 ready 的尾部，遇到 `Pending` 立即停止，不等待未来数据。得到的批次无论是否填满 MTU，都只要 8 槽 write window 尚有空间便立即提交；任何 partial write 都不会阻塞后续 write。字节内容和顺序不变。
 - SDP record 与动态 RFCOMM channel 在长期运行的 btrtty 进程内保持不变，绝不因普通 client disconnect 重新发布。macOS 15 的 `bluetoothd` 会丢弃尚未匹配到请求的 RFCOMM accept session，即使公开 API 返回的 Objective-C notification 仍被持有；因此仅在 `Waiting` 状态，native main thread 使用 500ms `CFRunLoopTimer` 为同一 channel 注册新 generation。连接交付、拒绝关闭中或已有 active client 时 timer 休眠；最近 5 秒的 generation 保留到握手回调安全期结束后才注销。接受连接时会先封存该 native channel identity，并注销当前 epoch 的全部 listener generation；真实 close callback 到达且 supervisor 重新开放 acceptance 后，才创建新的 listener epoch。旧 epoch 的延迟重复 open callback 既不能创建连接，也不能等待一个已经发生的 close callback。
 - 每个 active channel 都注册独立的 channel-close notification；actor 必须同时收到全部 outstanding write completions 和真实 channel-close callback，才会释放 channel 与 pending `Bytes`，这些事件无论以什么顺序到达都不能越过另一道屏障。超过单 active-client 限制的已打开 channel 也会被保留并等待真实 close callback，不会直接丢弃 Objective-C 对象。
 - RFCOMM write token 在 native submission 之前必须通过有界 ledger 的严格单调唯一性检查。queued/pending payload 由同一个 ledger 独占；重复 token 不会替换仍被 `writeAsync` 引用的 buffer。完成历史只保留一个单调 high-water mark，不随会话输出量增长。
@@ -96,7 +96,7 @@ dist/btrtty \
 
 Mac→Linux 不做应用层限速。PTY output staging 恰好容纳一个实际 RFCOMM MTU，outstanding command window 固定为 8。当前实机 MTU 为 667 时，应用层已读取但尚未完成的输出最多为 `9 × 667 = 6,003` 字节；超过边界后停止读取 PTY，由 kernel backpressure 阻塞输出源，不丢弃字节。
 
-发送端采用 event-driven tail coalescing：PTY 首次可读后只合并当下已经 ready 的字节，不 sleep、不启动 timer；空闲后的第一批字节随即发送。同一时刻最多有一个不足 MTU 的 write outstanding。这个 partial write 完成前，新尾部字节会在一个 MTU 的 staging 中自然合并，达到 MTU 时可以立即流水发送。它只改变 RFCOMM write 的分块边界，不改变 payload，也不按时间或字节速率限流。
+发送端只做零等待的即时批处理：PTY 首次可读后合并当下已经 ready 的字节，不 sleep、不启动 timer，也不等待未来 fragment。每个批次无论大小都使用同一个 8 槽异步 write window；只要窗口未满就立即提交，不等待任何较早 partial write 的 completion。窗口全满后，最多再保留一个 MTU 的 staging，随后停止读取 PTY 并由 kernel backpressure 限制输出源。
 
 默认值是 `exec /bin/bash -l`、24 行、80 列（即通常所说的 `80×24`）。每次客户端连接创建的新 PTY 都以当前用户的 `$HOME` 为初始工作目录；`$HOME` 缺失或无效时会话创建失败。正常启动会显示系统动态分配的 RFCOMM channel：
 

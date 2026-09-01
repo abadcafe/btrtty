@@ -33,7 +33,7 @@ fn test_schedule_next_submits_buffered_output_immediately() {
 }
 
 #[test]
-fn test_schedule_next_coalesces_partial_output_until_the_prior_partial_completes() {
+fn test_schedule_next_submits_partial_output_without_waiting_for_prior_completion() {
     let mut transmitter = Transmitter::new(128).unwrap();
     let sink = RecordingSink::default();
     let connection = ConnectionId::new(1).unwrap();
@@ -43,20 +43,12 @@ fn test_schedule_next_coalesces_partial_output_until_the_prior_partial_completes
     transmitter.append(b"second").unwrap();
     schedule_next(&mut transmitter, &sink, connection).unwrap();
 
-    let (token, length) = {
-        let commands = sink.commands.lock().unwrap();
-        assert_eq!(commands.len(), 1);
-        let BtCommand::Send { token, data, .. } = &commands[0] else {
-            panic!("scheduler submitted a non-write command");
-        };
-        (*token, data.len())
-    };
-
-    transmitter.complete(token, length).unwrap();
-    schedule_next(&mut transmitter, &sink, connection).unwrap();
-
     let commands = sink.commands.lock().unwrap();
     assert_eq!(commands.len(), 2);
+    let BtCommand::Send { data, .. } = &commands[0] else {
+        panic!("scheduler submitted a non-write command");
+    };
+    assert_eq!(&data[..], b"first");
     let BtCommand::Send { data, .. } = &commands[1] else {
         panic!("scheduler submitted a non-write command");
     };

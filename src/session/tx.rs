@@ -15,11 +15,9 @@ pub(super) struct TxWrite {
 
 /// A bounded byte-stream staging area with MTU packetization and write ownership.
 ///
-/// The first partial packet is latency-sensitive and leaves immediately. While
-/// that partial packet is outstanding, later tail bytes stay in staging until
-/// they fill an MTU or the partial write completes. Full MTU packets may still
-/// pipeline. This is event-driven tail coalescing: it avoids a small-write storm
-/// without a rate limiter or a batching timer.
+/// Every staged byte is eligible for immediate submission while the native
+/// write window has capacity. Packet size never changes scheduling semantics:
+/// full and partial MTU writes use the same bounded asynchronous window.
 pub(super) struct Transmitter {
     mtu: usize,
     staging: BytesMut,
@@ -69,9 +67,6 @@ impl Transmitter {
             return None;
         }
         let length = self.mtu.min(self.staging.len());
-        if length < self.mtu && self.has_partial_write() {
-            return None;
-        }
         let data = self.staging.split_to(length).freeze();
         let token = next_write_token();
         self.outstanding.insert(token, length);
@@ -90,10 +85,6 @@ impl Transmitter {
         }
         self.outstanding.remove(&token);
         Ok(())
-    }
-
-    fn has_partial_write(&self) -> bool {
-        self.outstanding.values().any(|length| *length < self.mtu)
     }
 }
 

@@ -31,45 +31,34 @@ fn test_transmitter_exposes_idle_byte_immediately() {
 }
 
 #[test]
-fn test_transmitter_holds_a_second_partial_write_until_the_first_completes() {
+fn test_transmitter_pipelines_partial_writes_without_waiting_for_completion() {
     let mut transmitter = Transmitter::new(64).unwrap();
     transmitter.append(b"first").unwrap();
     let first = start_next(&mut transmitter);
 
     transmitter.append(b"second").unwrap();
-    assert!(transmitter.start_write().is_none());
+    let second = start_next(&mut transmitter);
 
-    transmitter.complete(first.token, first.data.len()).unwrap();
-    assert_eq!(&start_next(&mut transmitter).data[..], b"second");
+    assert_eq!(&first.data[..], b"first");
+    assert_eq!(&second.data[..], b"second");
 }
 
 #[test]
-fn test_transmitter_pipelines_full_mtu_while_a_partial_write_is_outstanding() {
-    let mut transmitter = Transmitter::new(8).unwrap();
-    transmitter.append(b"x").unwrap();
-    let partial = start_next(&mut transmitter);
+fn test_transmitter_partial_writes_use_the_entire_native_window() {
+    let mut transmitter = Transmitter::new(64).unwrap();
+    let mut writes = Vec::new();
 
-    transmitter.append(b"abcdefgh").unwrap();
-    let full = start_next(&mut transmitter);
-
-    assert_eq!(&partial.data[..], b"x");
-    assert_eq!(&full.data[..], b"abcdefgh");
-}
-
-#[test]
-fn test_transmitter_does_not_release_a_partial_on_an_unrelated_completion() {
-    let mut transmitter = Transmitter::new(8).unwrap();
-    transmitter.append(b"x").unwrap();
-    let partial = start_next(&mut transmitter);
-    transmitter.append(b"abcdefgh").unwrap();
-    let full = start_next(&mut transmitter);
+    for _ in 0..MAX_RFCOMM_WRITE_COMMANDS {
+        transmitter.append(b"x").unwrap();
+        writes.push(start_next(&mut transmitter));
+    }
     transmitter.append(b"tail").unwrap();
 
-    transmitter.complete(full.token, full.data.len()).unwrap();
+    assert!(transmitter.window_full());
     assert!(transmitter.start_write().is_none());
 
     transmitter
-        .complete(partial.token, partial.data.len())
+        .complete(writes[3].token, writes[3].data.len())
         .unwrap();
     assert_eq!(&start_next(&mut transmitter).data[..], b"tail");
 }
