@@ -9,7 +9,7 @@
 ## 架构
 
 ```mermaid
-flowchart LR
+flowchart TD
     subgraph Linux[Linux]
         C["rfcomm -r connect"] --> T["/dev/rfcomm0"]
         T --> U["picocom / screen / minicom"]
