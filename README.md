@@ -1,49 +1,40 @@
 # btrtty
 
-`btrtty` 把 macOS PTY 发布成标准 Bluetooth Classic Serial Port Profile（SPP）服务。Linux 将它作为普通 RFCOMM 串口连接后，可以用 `picocom`、`screen`、`minicom` 或其他 raw serial client 操作 Mac 上的 bash/tmux。
+## 简介
 
-```text
-Linux terminal                    Mac
-picocom / screen                  btrtty
-        ↕                              ↕
-/dev/rfcomm0 ← raw RFCOMM/SPP → async PTY ←→ bash/tmux
+`btrtty` 是一个 macOS 命令行程序，用 Bluetooth Classic RFCOMM 提供交互式 PTY。Linux 端通过 RFCOMM 串口连接后，可以使用 `picocom`、`screen` 或其他串口终端操作 Mac 上的 shell。
+
+程序发布名为 `Btrtty Terminal` 的标准 Serial Port Profile（UUID `0x1101`）SDP service，RFCOMM channel 由 macOS 动态分配。每次只接受一个已配对的 Bluetooth 设备，并把 RFCOMM 与 PTY 之间的数据按原始字节转发。
+
+## 架构
+
+```mermaid
+flowchart LR
+    subgraph Linux[Linux]
+        C["rfcomm -r connect"] --> T["/dev/rfcomm0"]
+        T --> U["picocom / screen / minicom"]
+    end
+
+    subgraph Mac["macOS btrtty"]
+        B["主线程<br/>IOBluetooth SDP/RFCOMM<br/>CFRunLoop<br/>单 active client"]
+        I["Tokio input queue<br/>有界容量 128"]
+        P["PTY master"]
+        S["PTY slave<br/>/bin/sh -lc command"]
+        O["Tokio output path<br/>MTU staging<br/>最多 8 个异步写"]
+
+        B -->|RFCOMM RX| I -->|原始字节| P
+        P <--> S
+        P -->|PTY output| O -->|RFCOMM writeAsync| B
+    end
+
+    C <-->|Bluetooth Classic RFCOMM| B
 ```
 
-当前 v0.1 使用固定 PTY 尺寸、单个 active client、系统配对认证和透明字节流。不会解析 ANSI、转换 CRLF、插入控制帧、限制传输速率或记录终端 payload。
+主线程独占 IOBluetooth 对象和 macOS run loop；Tokio 运行 PTY、shell child、输入泵和输出调度。RFCOMM 输入进入有界队列，队列满时关闭当前连接；PTY 输出按实际 MTU 分块，并由有限的异步写窗口提供反压。
 
-## 架构约束
+## 编译/安装/使用方式
 
-```text
-macOS main thread                 Tokio runtime（2 workers）
-┌──────────────────────┐         ┌──────────────────────────┐
-│ IOBluetooth actor    │ events  │ async supervisor         │
-│ SDP / RFCOMM delegate├────────►│ input task / child wait  │
-│ CFRunLoopSource      │◄────────┤ PTY reader + TX staging  │
-└──────────────────────┘ commands└──────────────────────────┘
-```
-
-- IOBluetooth 对象只存在于 `MainThreadOnly` actor，未实现或伪造 `Send`/`Sync`。
-- data callback 只复制 payload 并尝试写入有界输入通道；close、flow-control 和 write-completion callback 只投递 native action，其中可重复的 flow/input-overflow hint 会合并。incoming-open callback 只建立 channel 所有权、delegate 和 close notification；所有应用状态转换都在 callback 栈外执行。任何 callback 都不操作 PTY、不等待、不执行 shell。
-- Tokio 命令经 `CFRunLoopSourceSignal` + `CFRunLoopWakeUp` 送回主线程，无轮询。
-- 每条连接都有不可复用的 `ConnectionId`；`Send`、`Close`、write completion、input 和 disconnect 全部带连接 ID。旧连接的延迟事件/命令不能命中新连接。首次 acceptance 在 listener publication 前已经 armed；之后只有上一条连接的真实 close callback 才能产生一次性的 reconnect permit。
-- RFCOMM 只使用 `writeAsync`，每次提交都不超过实际 MTU，同时最多保留 8 个尚未完成的 write。Bluetooth flow control 或该窗口满时停止继续提交。
-- PTY output 直接读入恰好一个 RFCOMM MTU 的 staging buffer，不存在限速器、发送 timer、固定合并 timer 或中间 chunk channel。每批读取只等待首个 PTY fragment，随后在同一 Tokio 调度轮次内继续吸收已经 ready 的尾部，遇到 `Pending` 立即停止，不等待未来数据。得到的批次无论是否填满 MTU，都只要 8 槽 write window 尚有空间便立即提交；任何 partial write 都不会阻塞后续 write。字节内容和顺序不变。
-- SDP record 与动态 RFCOMM channel 在长期运行的 btrtty 进程内保持不变，绝不因普通 client disconnect 重新发布。macOS 15 的 `bluetoothd` 会丢弃尚未匹配到请求的 RFCOMM accept session，即使公开 API 返回的 Objective-C notification 仍被持有；因此仅在 `Waiting` 状态，native main thread 使用 500ms `CFRunLoopTimer` 为同一 channel 注册新 generation。连接交付、拒绝关闭中或已有 active client 时 timer 休眠；最近 5 秒的 generation 保留到握手回调安全期结束后才注销。接受连接时会先封存该 native channel identity，并注销当前 epoch 的全部 listener generation；真实 close callback 到达且 supervisor 重新开放 acceptance 后，才创建新的 listener epoch。旧 epoch 的延迟重复 open callback 既不能创建连接，也不能等待一个已经发生的 close callback。
-- 每个 active channel 都注册独立的 channel-close notification；actor 必须同时收到全部 outstanding write completions 和真实 channel-close callback，才会释放 channel 与 pending `Bytes`，这些事件无论以什么顺序到达都不能越过另一道屏障。超过单 active-client 限制的已打开 channel 也会被保留并等待真实 close callback，不会直接丢弃 Objective-C 对象。
-- RFCOMM write token 在 native submission 之前必须通过有界 ledger 的严格单调唯一性检查。queued/pending payload 由同一个 ledger 独占；重复 token 不会替换仍被 `writeAsync` 引用的 buffer。完成历史只保留一个单调 high-water mark，不随会话输出量增长。
-- `CFRunLoopSource` 和 listener timer 由同一个 RAII callback guard 管理。正常退出、启动失败、提前 drop 和 unwind 都先 deactivate dispatcher，再 invalidate/remove 两类 callback，最后才释放其 boxed callback context；不存在仍可触发的悬空 `info` 指针。
-- 最终关闭顺序固定为：停止 PTY 和新 write → 等待全部 outstanding writes → 请求关闭已知 channel → 等待全部 channel-close callbacks → 删除 SDP record → 注销 incoming notification → 停止 CFRunLoop。不得提前报告 native shutdown 完成。
-- `closeChannel()` 提交失败时不会用设备级 ACL 关闭兜底，也不会假装 channel 已关闭；actor 保留所有权并继续等远端真实 close callback，完成资源清理后以错误状态退出。
-- IOBluetooth 不提供枚举或取消 pre-open pending incoming connection 的公开 API。SIGINT/SIGTERM 的明确前置条件是操作者先停止 Linux 侧所有新连接和自动重试；btrtty 不包含虚假的 drain、延时轮询或 publish-remove-republish 清理。
-- 进程持有排他单实例锁；第二个 btrtty 会直接报错，不会与旧 listener 竞争或尝试接管其 channel。
-- 启动只发布一次 transient SDP record。所有可能失败的 CFRunLoop 基础设施在发布前创建；notification 注册失败时必须成功回滚本次 SDP record，否则启动直接报错。
-- Mac→Linux 没有应用层限速。PTY staging 固定为一个实际 MTU；8 个 outstanding writes 全满后最多再从 PTY 读取一个 MTU，随后通过 PTY/kernel 自然反压，不丢字符。应用层已读取但尚未收到 completion 的总上限为 9 个 MTU。
-- Linux→Mac payload 使用独立 Tokio input task 和 `128` 条 bounded input queue，不与 PTY output 调度共用 `select!`。队列满会关闭当前连接，不会无限增长；断线/退出会取消正在等待 PTY 可写的 future，旧连接残留输入在重新开放 accept gate 前清空。
-- SIGINT/SIGTERM handler 在 SDP publication 前完成安装。Tokio application task 即使 panic，watchdog 也会请求 native shutdown；PTY reader、child reap 和 native teardown 的错误均会返回，不会静默吞掉。
-
-## 构建
-
-需要 macOS、Command Line Tools/Xcode 和当前 Rust stable。项目不声明或维护旧编译器 MSRV；`rust-toolchain.toml`、本地构建和 CI 均只使用 stable：
+服务端必须在 macOS 上运行，并使用 Rust stable：
 
 ```bash
 cargo build --release
@@ -51,145 +42,63 @@ cargo test --all-targets
 cargo clippy --all-targets --all-features -- -D warnings
 ```
 
-生成内嵌 Bluetooth 权限说明的 ad-hoc signed 单文件命令行程序：
+生成 ad-hoc signed 单文件：
 
 ```bash
 ./scripts/package.sh
 ```
 
-输出在 `dist/btrtty`。发布签名时可传入正式身份：
+产物为 `dist/btrtty`，不是 App Bundle。需要安装到 `PATH` 时：
 
 ```bash
-CODESIGN_IDENTITY='Developer ID Application: Example (TEAMID)' \
-  ./scripts/package.sh
+sudo install -m 755 dist/btrtty /usr/local/bin/btrtty
 ```
 
-需要全局使用时，将这一个文件安装到 `PATH`：
+先通过 macOS 和 Linux 的系统 Bluetooth 设置完成配对，然后在 Mac 启动：
 
 ```bash
-install -m 755 dist/btrtty /usr/local/bin/btrtty
+btrtty
 ```
 
-## 配对准入
-
-btrtty 不使用自定义静态 PIN，也不保存配对码。先由 macOS 与 GNOME 的系统 Bluetooth UI 完成 Secure Simple Pairing：
-
-1. 在 Mac 打开 `System Settings → Bluetooth`。
-2. 在 Linux 打开 `GNOME Settings → Bluetooth`，选择该 Mac。
-3. 两边显示同一数字时，在两边确认。
-4. Linux 可用 `bluetoothctl info MAC_BT_ADDRESS` 检查 `Paired: yes`。
-
-配对码只在首次配对时用于建立系统配对关系，reconnect 不会再次要求输入。Mac 在创建 PTY 前检查设备的系统配对状态；未配对的连接不会得到 shell。btrtty 不额外要求当前 RFCOMM 链路启用加密。
-
-安全边界是“仍在这台 Mac 配对列表中的 Bluetooth 设备”，不再维护地址 allowlist。撤销权限时，请在 macOS Bluetooth 设置中 Forget/Remove 该设备。
-
-## macOS 使用
-
-PTY 大小在启动时通过 `--rows` 和 `--cols` 指定，连接期间保持不变：
+默认执行 `exec /bin/bash -l`，PTY 为 24 行、80 列。也可以指定 shell 命令和尺寸：
 
 ```bash
-dist/btrtty \
+btrtty \
+  --command 'exec /bin/bash -l' \
   --rows 24 \
-  --cols 80 \
-  --command '/opt/homebrew/bin/tmux -T RGB new-session -A -s btrtty'
+  --cols 80
 ```
 
-Mac→Linux 不做应用层限速。PTY output staging 恰好容纳一个实际 RFCOMM MTU，outstanding command window 固定为 8。当前实机 MTU 为 667 时，应用层已读取但尚未完成的输出最多为 `9 × 667 = 6,003` 字节；超过边界后停止读取 PTY，由 kernel backpressure 阻塞输出源，不丢弃字节。
-
-发送端只做零等待的即时批处理：PTY 首次可读后合并当下已经 ready 的字节，不 sleep、不启动 timer，也不等待未来 fragment。每个批次无论大小都使用同一个 8 槽异步 write window；只要窗口未满就立即提交，不等待任何较早 partial write 的 completion。窗口全满后，最多再保留一个 MTU 的 staging，随后停止读取 PTY 并由 kernel backpressure 限制输出源。
-
-默认值是 `exec /bin/bash -l`、24 行、80 列（即通常所说的 `80×24`）。每次客户端连接创建的新 PTY 都以当前用户的 `$HOME` 为初始工作目录；`$HOME` 缺失或无效时会话创建失败。正常启动会显示系统动态分配的 RFCOMM channel：
+启动后记录实际输出的 Bluetooth address 和 RFCOMM channel：
 
 ```text
 Registered Bluetooth Serial Port
-Bluetooth address: 10:B5:88:4D:11:18
-SDP record handle: 0x4F491101
+Bluetooth address: AA:BB:CC:DD:EE:FF
+SDP record handle: 0xXXXXXXXX
 RFCOMM channel: 11
 Waiting for paired client...
 ```
 
-客户端断开时，btrtty 必须同时等到全部 outstanding write completions（若存在）和 IOBluetooth 的实际 channel-close callback，随后销毁本次 PTY、开放下一次 acceptance，并为同一 RFCOMM channel 开始新的 incoming-listener epoch；若请求尚未来到，Waiting-only native timer 继续续发 generation。上一 epoch 的 generation 已在连接 acceptance 时全部注销，其 channel identity 在新 epoch 开始前保持 fenced。SDP record 全程不动。SIGINT/SIGTERM 也必须跨过前述两道屏障，之后才依次删除 SDP、注销仍存在的 waiting listener generation 并退出。
-
-### 长期运行与退出契约
-
-推荐在 tmux 中启动一次 btrtty，日常只 detach tmux；Linux 可以反复 connect/disconnect，不需要重启 btrtty。
-
-IOBluetooth 只在 RFCOMM channel 已经打开以后通知应用，btrtty 无法观察 `bluetoothd` 已收到但尚未交付的 pending connection。因此停止服务前，操作者必须先停止 Linux 上的 `rfcomm connect` 以及任何自动重试，再向 btrtty 发送 SIGINT/SIGTERM。程序不会用等待固定秒数、关闭设备 ACL、切换 Bluetooth controller 或杀死 `bluetoothd` 来假装清理完成。
-
-若旧版或异常退出已经使 macOS Bluetooth daemon 留下不可见的 RFCOMM 状态，新进程无法通过公开 IOBluetooth API 枚举或删除它。一次性恢复流程是：停止 Linux 连接、退出 btrtty、在 macOS 关闭并重新打开 Bluetooth，然后启动当前版本。该全局操作只用于人工故障恢复，不属于 btrtty 启动或关闭流程。
-
-Linux 窗口变化不会修改 Mac PTY；需要其他尺寸时，使用新的 `--rows/--cols` 重启 server。tmux 模式下，Bluetooth 断线只销毁本次 PTY client；tmux session 本身保留，重连会重新 attach。
-
-### Bluetooth 权限
-
-`btrtty` 可执行文件的 Mach-O `__TEXT,__info_plist` section 内嵌了 `CFBundleIdentifier=dev.btrtty.terminal` 和 `NSBluetoothAlwaysUsageDescription`。首次运行时请处理系统 Bluetooth 授权提示，或到：
-
-```text
-System Settings → Privacy & Security → Bluetooth
-```
-
-允许 `btrtty` 访问 Bluetooth。不要用 `sudo` 启动。开发时如需重置权限，使用：
-
-```bash
-tccutil reset BluetoothAlways dev.btrtty.terminal
-```
-
-## Linux 连接
-
-完成 GNOME 配对后，使用 Mac 启动日志显示的 Bluetooth address 和 RFCOMM channel：
-
-```bash
-sudo rfcomm -r connect /dev/rfcomm0 MAC_BT_ADDRESS 11
-```
-
-另一个终端运行：
-
-```bash
-picocom -b 115200 --flow n /dev/rfcomm0
-```
-
-`-r` 必须位于 `connect` 前面。它让 BlueZ 在创建 RFCOMM TTY 后立即切换到 raw mode，避免 picocom 打开设备前，Linux TTY 的默认 canonical/echo line discipline 把 Mac 的初始 prompt 回送给 Mac shell，形成输出回声环。这里的 `115200` 只是 serial client 需要的名义波特率，不控制 Bluetooth 吞吐。
-
-picocom 中的普通 Ctrl-C 是发给 Mac PTY 的字节 `0x03`，不会断开 Bluetooth。需要主动断开时，先用 picocom 的退出键关闭 serial client，再在运行 `rfcomm connect` 的终端按 Ctrl-C；`rfcomm` 创建的 TTY 使用 `RELEASE_ONHUP`，只有最后一个打开 `/dev/rfcomm0` 的进程退出后 Linux 才会真正释放它。必要时可显式释放：
-
-```bash
-sudo rfcomm release /dev/rfcomm0
-```
-
-准备停止 Mac 上长期运行的 btrtty 时，必须先执行 release，并确认没有 `rfcomm connect` 或其他客户端在自动重试，然后再向 btrtty 发送 SIGINT/SIGTERM。
-
-BlueZ 上游把传统 `rfcomm` CLI 放在 deprecated tools 构建选项中，因此部分发行版不会默认安装。先检查：
+Linux 先确认存在 BlueZ 的 `rfcomm` 命令：
 
 ```bash
 command -v rfcomm
 ```
 
-若发行版没有该命令，可以安装其 legacy/deprecated BlueZ tools 包；也可以使用 BlueZ/BlueR 项目的 `rfcat connect --raw MAC_BT_ADDRESS` 直接连接标准 SerialPort profile。后者不创建 `/dev/rfcomm0`。
-
-## Truecolor
-
-RFCOMM 是透明字节流，`ESC[38;2;R;G;Bm` 等 truecolor 序列会原样到达 Linux terminal。btrtty 在 Mac PTY 中统一设置：
-
-```text
-TERM=xterm-256color
-COLORTERM=truecolor
-```
-
-`btrtty` 使用系统已有的 `xterm-256color`，不安装自定义终端描述，也不设置 `TERMINFO`。这使嵌套 SSH、sudo、容器和远端主机继续使用通用终端类型。`COLORTERM=truecolor` 告知支持该约定的程序可以输出 24-bit color。
-
-Linux 端必须使用实际支持 truecolor 的终端，例如 GNOME Terminal、Kitty、WezTerm 等。可在 Mac shell 中检查：
+连接并打开终端：
 
 ```bash
-test "$TERM" = xterm-256color
-printf '\033[48;2;255;80;40m truecolor \033[0m\n'
+sudo rfcomm -r connect /dev/rfcomm0 MAC_BT_ADDRESS CHANNEL
+picocom -b 115200 --flow n /dev/rfcomm0
 ```
 
-tmux 必须明确获知外层支持 RGB，因此推荐命令使用 `tmux -T RGB`。tmux 内部将 `TERM` 设置为 `tmux-256color`，这是正常行为。
+`CHANNEL` 使用 Mac 启动日志中的实际值；`115200` 只是串口客户端参数，不是 Bluetooth 链路限速。退出时先关闭 `picocom`，再在运行 `rfcomm connect` 的终端按 Ctrl-C。
 
-## 透明性与日志
+## 已知问题
 
-RFCOMM payload 与 PTY payload 一一对应：Ctrl-C、Ctrl-Z、Tab、方向键、UTF-8、NUL 和 ANSI 序列均不被 btrtty 解释。标准 `rfcomm`、`picocom`、`screen` 和 `minicom` 不需要了解 btrtty。
-
-运行日志不包含 terminal payload。
-
-真实 Mac + Linux Bluetooth 硬件验收步骤记录在 [docs/hardware-acceptance.md](docs/hardware-acceptance.md)。
+- 仅实现 macOS 服务端；Linux 端依赖发行版提供的 BlueZ `rfcomm` 工具，部分发行版默认不安装该 deprecated 工具。
+- 当前只检查远端设备是否已配对，没有 `--allow-device` 地址白名单，也不额外要求 RFCOMM 链路加密。
+- 只允许一个 active client；第二个连接会被关闭。
+- PTY 尺寸只在连接创建时设置，连接期间没有 resize 协议；`TERM` 固定为 `xterm-256color`，`COLORTERM` 固定为 `truecolor`。
+- RFCOMM 输入队列溢出会关闭当前连接；PTY 输出使用有界缓冲，不保证在无线链路异常时保持连接。
+- 自动化测试不替代真实 Mac/Linux Bluetooth 双机测试；实际连接、重连、终端兼容性仍需使用目标硬件验证。
